@@ -1,0 +1,14 @@
+{
+  "name": "ndli-backend",
+  "version": "1.0.0",
+  "description": "Proxy backend for NDLI Search — forwards requests to the NDLI API to bypass CORS",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  }
+}

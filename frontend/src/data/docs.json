@@ -1,0 +1,18 @@
+[
+  {
+    "id": "doc1",
+    "title": "Newton's Laws of Motion",
+    "author": "OpenStax",
+    "type": "Textbook",
+    "url": "#",
+    "content": "Newton's laws of motion describe the relationship between a body and the forces acting upon it. The first law states that an object remains at rest or in uniform motion unless acted upon by a force..."
+  },
+  {
+    "id": "doc2",
+    "title": "Newton’s Method in Numerical Analysis",
+    "author": "Gilbert Strang",
+    "type": "Lecture Notes",
+    "url": "#",
+    "content": "Newton's method is an iterative numerical technique used to find roots of real-valued functions. Starting from an initial guess, the method refines the solution..."
+  }
+]

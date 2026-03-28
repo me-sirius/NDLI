@@ -1,27 +1,57 @@
-// In development: Vite proxy rewrites /api/ndli/* → https://test.ndl.iitkgp.ac.in/rest/*
-// In production:  Requests go to the Express backend at VITE_API_URL (e.g. http://localhost:4000)
+// Frontend should only call backend URL from env (for example, ngrok URL).
+const API_BASE = (import.meta.env.VITE_API_URL || '').trim().replace(/\/$/, '');
+const REQUEST_TIMEOUT_MS = 15000;
 
-const API_BASE = import.meta.env.VITE_API_URL || '';
-
-export async function ndliSearch(query, domain = 'se') {
-  const formData = new FormData();
-  formData.append('query', query);
-  formData.append('domain', domain);
-
-  // Dev  → /api/ndli/aiOverview.php  (Vite proxy handles it)
-  // Prod → http://localhost:4000/api/search  (Express backend)
-  const url = API_BASE
-    ? `${API_BASE}/api/search`
-    : '/api/ndli/aiOverview.php';
-
-  const res = await fetch(url, {
-    method: 'POST',
-    body: formData,
-  });
-
-  if (!res.ok) {
-    throw new Error('NDLI search failed');
+function getSearchEndpoint() {
+  if (!API_BASE) {
+    throw new Error('VITE_API_URL is missing. Set it in frontend/.env');
   }
 
-  return res.json();
+  return `${API_BASE}/api/search`;
+}
+
+async function fetchWithTimeout(url, options, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export async function ndliSearch(query, domain = 'se') {
+  try {
+    const res = await fetchWithTimeout(getSearchEndpoint(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query, domain }),
+    });
+
+    if (!res.ok) {
+      let message = 'NDLI search failed';
+      try {
+        const err = await res.json();
+        if (err?.error) message = err.error;
+      } catch {
+        // Keep fallback message when response is not JSON.
+      }
+      throw new Error(message);
+    }
+
+    return res.json();
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Search request timed out after ${REQUEST_TIMEOUT_MS}ms.`);
+    }
+
+    if (err.name === 'TypeError') {
+      throw new Error('Unable to reach backend. Check VITE_API_URL and backend CORS settings.');
+    }
+
+    throw err;
+  }
 }

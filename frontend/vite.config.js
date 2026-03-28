@@ -7,11 +7,9 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/api/ndli': {
-        target: 'https://test.ndl.iitkgp.ac.in',
+      '/api': {
+        target: 'http://localhost:4000',
         changeOrigin: true,
-        secure: false,
-        rewrite: (path) => path.replace(/^\/api\/ndli/, '/rest'),
       },
     },
   },

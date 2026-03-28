@@ -1,5 +1,7 @@
 import express from 'express';
 import cors from 'cors';
+import { fileURLToPath } from 'url';
+import { buildExtractiveOverview } from './summarizer.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
@@ -12,6 +14,7 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || DEFAULT_CORS_ORIGINS.join(',')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+const CURRENT_FILE = fileURLToPath(import.meta.url);
 
 function createRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -147,16 +150,24 @@ app.post('/api/search', async (req, res) => {
     const raw = await ndliRes.json();
     const rows = Array.isArray(raw?.rows) ? raw.rows : [];
     const normalizedRows = rows.map(normalizeRow).filter((r) => r.title || r.desc);
+    const aiOverview = buildExtractiveOverview({
+      query,
+      rows: normalizedRows,
+      minSentences: 2,
+      maxSentences: 4,
+    });
 
     res.json({
       query,
       domain,
       count: normalizedRows.length,
+      aiOverview,
       rows: normalizedRows,
     });
 
     console.info(`[${requestId}] /api/search: response sent`, {
       resultCount: normalizedRows.length,
+      aiSentenceCount: aiOverview?.sentences?.length || 0,
       totalDurationMs: Date.now() - startMs,
     });
   } catch (err) {
@@ -201,12 +212,19 @@ app.use((err, _req, res, next) => {
   return next(err);
 });
 
-// ─── Start ───────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`\n🚀 NDLI Backend running on http://localhost:${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/health`);
-  console.log(`   Search proxy: POST http://localhost:${PORT}/api/search\n`);
-  console.log(`   NDLI URL: ${NDLI_URL}`);
-  console.log(`   NDLI timeout: ${NDLI_TIMEOUT_MS}ms`);
-  console.log(`   CORS origins: ${CORS_ORIGINS.join(', ')}\n`);
-});
+function startServer() {
+  app.listen(PORT, () => {
+    console.log(`\n🚀 NDLI Backend running on http://localhost:${PORT}`);
+    console.log(`   Health check: http://localhost:${PORT}/health`);
+    console.log(`   Search proxy: POST http://localhost:${PORT}/api/search\n`);
+    console.log(`   NDLI URL: ${NDLI_URL}`);
+    console.log(`   NDLI timeout: ${NDLI_TIMEOUT_MS}ms`);
+    console.log(`   CORS origins: ${CORS_ORIGINS.join(', ')}\n`);
+  });
+}
+
+if (process.argv[1] === CURRENT_FILE) {
+  startServer();
+}
+
+export default app;

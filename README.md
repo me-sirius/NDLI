@@ -36,6 +36,7 @@ ndli-mock/
 │
 ├── backend/                   # Express proxy backend
 │   ├── server.js              # Proxy server (forwards to NDLI API)
+│   ├── vercel.json            # Vercel routing/build config
 │   ├── package.json
 │   └── .gitignore
 │
@@ -70,14 +71,18 @@ npm install
 
 ### 3. Configure environment
 
-Create env files from examples:
+Create these env files manually:
 
-```bash
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env
+`backend/.env`
+
+```env
+PORT=4000
+NDLI_URL=https://test.ndl.iitkgp.ac.in/rest/aiOverview.php
+NDLI_TIMEOUT_MS=15000
+CORS_ORIGINS=http://localhost:5173,http://localhost:4173,https://your-frontend-domain.vercel.app
 ```
 
-Update `frontend/.env`:
+`frontend/.env`
 
 ```env
 VITE_API_URL=http://localhost:4000
@@ -101,6 +106,9 @@ npm run dev
 # → http://localhost:5173
 ```
 
+In local development, frontend still calls backend URL from `VITE_API_URL`.
+Set `VITE_API_URL=http://localhost:4000` in `frontend/.env` to use local backend.
+
 ### 5. Run in production mode
 
 ```bash
@@ -117,21 +125,46 @@ cd ../backend
 npm start
 ```
 
-### 6. Deploy backend to cloud
+### 6. Deploy backend on Vercel and continue frontend locally
 
-Set these backend environment variables on your cloud host:
+Backend deploy (Vercel):
 
-- `PORT` (cloud usually injects this)
-- `NDLI_URL=https://test.ndl.iitkgp.ac.in/rest/aiOverview.php`
-- `NDLI_TIMEOUT_MS=15000`
-- `CORS_ORIGINS=https://your-frontend-domain.com`
+1. Create a new Vercel project from `backend/`.
+2. Keep framework preset as **Other**.
+3. Vercel uses `backend/vercel.json` to route all requests to `server.js`.
+4. Set backend environment variables in Vercel:
 
-Then deploy `backend/` and run:
+```env
+NDLI_URL=https://test.ndl.iitkgp.ac.in/rest/aiOverview.php
+NDLI_TIMEOUT_MS=15000
+CORS_ORIGINS=http://localhost:5173,http://localhost:4173,https://your-frontend-domain.vercel.app
+```
+
+5. Deploy and verify:
+- `GET https://your-backend-domain.vercel.app/health`
+- `POST https://your-backend-domain.vercel.app/api/search`
+
+Local frontend (continue development):
+
+1. Set `frontend/.env`:
+
+```env
+VITE_API_URL=https://your-backend-domain.vercel.app
+```
+
+2. Run frontend locally:
 
 ```bash
-npm install
-npm start
+cd frontend
+npm run dev
 ```
+
+3. Open local app and search; requests now go to your Vercel backend.
+
+Important:
+
+- `CORS_ORIGINS` must include `http://localhost:5173` for local frontend dev.
+- Add your deployed frontend origin (e.g. Vercel frontend URL) in `CORS_ORIGINS` for production usage.
 
 ## 🌐 Search Domains
 
@@ -192,6 +225,7 @@ Backend responds with normalized JSON:
 - NDLI API communication is done only from backend to avoid browser CORS/network restrictions.
 - Search is debounced at 600ms to prevent excessive API calls.
 - The AI summary is an extractive summary from the top 3 results (not a generative AI model).
+- For local frontend + hosted backend, set `frontend/.env` with hosted backend URL via `VITE_API_URL`.
 
 ---
 

@@ -121,15 +121,28 @@ export default function Home() {
                 const rows = data.rows || [];
                 setResults(rows);
 
-                if (rows.length) {
-                    const snippet = rows.map(r => r.desc || r.title).slice(0, 3).join(' ');
+                const fallbackSources = rows.slice(0, 3).map((r) => ({
+                    title: r.title,
+                    url: r.url || '#',
+                    author: r.author || 'NDLI',
+                }));
+
+                const backendOverview = data.aiOverview;
+                const backendSnippet = backendOverview?.snippet ||
+                    (Array.isArray(backendOverview?.sentences) ? backendOverview.sentences.join(' ') : '');
+
+                if (backendSnippet) {
                     setAiCard({
-                        snippet: snippet.slice(0, 500) + (snippet.length > 500 ? '...' : ''),
-                        sources: rows.slice(0, 3).map((r) => ({
-                            title: r.title,
-                            url: r.url || '#',
-                            author: r.author || 'NDLI',
-                        })),
+                        snippet: backendSnippet,
+                        sources: Array.isArray(backendOverview?.sources) && backendOverview.sources.length
+                            ? backendOverview.sources
+                            : fallbackSources,
+                    });
+                } else if (rows.length) {
+                    const fallbackSnippet = rows.map(r => r.desc || r.title).slice(0, 3).join(' ');
+                    setAiCard({
+                        snippet: fallbackSnippet.slice(0, 500) + (fallbackSnippet.length > 500 ? '...' : ''),
+                        sources: fallbackSources,
                     });
                 } else {
                     setAiCard(null);

@@ -79,7 +79,7 @@ Create these env files manually:
 PORT=4000
 NDLI_URL=https://test.ndl.iitkgp.ac.in/rest/aiOverview.php
 NDLI_TIMEOUT_MS=15000
-CORS_ORIGINS=http://localhost:5173,http://localhost:4173,https://your-frontend-domain.vercel.app
+CORS_ORIGINS=http://localhost:5173,http://localhost:4173,https://your-frontend-domain.vercel.app,https://your-frontend-domain-*.vercel.app
 ```
 
 `frontend/.env`
@@ -137,7 +137,7 @@ Backend deploy (Vercel):
 ```env
 NDLI_URL=https://test.ndl.iitkgp.ac.in/rest/aiOverview.php
 NDLI_TIMEOUT_MS=15000
-CORS_ORIGINS=http://localhost:5173,http://localhost:4173,https://your-frontend-domain.vercel.app
+CORS_ORIGINS=http://localhost:5173,http://localhost:4173,https://your-frontend-domain.vercel.app,https://your-frontend-domain-*.vercel.app
 ```
 
 5. Deploy and verify:
@@ -165,6 +165,7 @@ Important:
 
 - `CORS_ORIGINS` must include `http://localhost:5173` for local frontend dev.
 - Add your deployed frontend origin (e.g. Vercel frontend URL) in `CORS_ORIGINS` for production usage.
+- `CORS_ORIGINS` supports wildcard entries like `https://your-frontend-domain-*.vercel.app` for Vercel preview deployments.
 
 ## 🌐 Search Domains
 

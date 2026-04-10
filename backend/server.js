@@ -6,15 +6,56 @@ import { buildExtractiveOverview } from './summarizer.js';
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 const NDLI_URL = process.env.NDLI_URL || 'https://test.ndl.iitkgp.ac.in/rest/aiOverview.php';
-const NDLI_TIMEOUT_MS = Number(process.env.NDLI_TIMEOUT_MS) || 15000;
+const NDLI_TIMEOUT_MS = parsePositiveInt(process.env.NDLI_TIMEOUT_MS, 25000);
+const NDLI_RETRY_COUNT = parseNonNegativeInt(process.env.NDLI_RETRY_COUNT, 1);
+const NDLI_RETRY_DELAY_MS = parsePositiveInt(process.env.NDLI_RETRY_DELAY_MS, 350);
 const ALLOWED_DOMAINS = new Set(['se', 'he', 'cd', 'rs', 'ps', 'jr', 'ca', 'na']);
 const DEFAULT_CORS_ORIGINS = ['http://localhost:5173', 'http://localhost:4173'];
+const RETRYABLE_UPSTREAM_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+]);
 
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || DEFAULT_CORS_ORIGINS.join(','))
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+const CORS_ORIGIN_RULES = CORS_ORIGINS.map((rule) => ({
+  rule,
+  matcher: rule.includes('*')
+    ? new RegExp(`^${rule
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/\\\*/g, '.*')}$`)
+    : null,
+}));
 const CURRENT_FILE = fileURLToPath(import.meta.url);
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function parseNonNegativeInt(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableUpstreamStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+function isRetryableUpstreamError(error) {
+  const causeCode = error?.cause?.code;
+  return error?.name === 'AbortError' || RETRYABLE_UPSTREAM_CODES.has(causeCode);
+}
 
 function createRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -55,7 +96,89 @@ function normalizeRow(row, index) {
 }
 
 function isAllowedOrigin(origin) {
-  return CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin);
+  return CORS_ORIGIN_RULES.some(({ rule, matcher }) => {
+    if (rule === '*') return true;
+    if (matcher) return matcher.test(origin);
+    return rule === origin;
+  });
+}
+
+async function fetchFromNdliWithRetry({ requestId, payload, domain }) {
+  const totalAttempts = NDLI_RETRY_COUNT + 1;
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), NDLI_TIMEOUT_MS);
+    const upstreamStartMs = Date.now();
+
+    try {
+      console.info(`[${requestId}] /api/search: forwarding to NDLI`, {
+        ndliUrl: NDLI_URL,
+        domain,
+        attempt,
+        totalAttempts,
+      });
+
+      const ndliRes = await fetch(NDLI_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: payload,
+        signal: controller.signal,
+      });
+
+      console.info(`[${requestId}] /api/search: NDLI responded`, {
+        status: ndliRes.status,
+        statusText: ndliRes.statusText,
+        upstreamDurationMs: Date.now() - upstreamStartMs,
+        attempt,
+        totalAttempts,
+      });
+
+      if (attempt < totalAttempts && isRetryableUpstreamStatus(ndliRes.status)) {
+        console.warn(`[${requestId}] /api/search: retrying NDLI after upstream status`, {
+          status: ndliRes.status,
+          attempt,
+          totalAttempts,
+        });
+
+        try {
+          await ndliRes.arrayBuffer();
+        } catch {
+          // Ignore response drain issues before retrying.
+        }
+
+        await wait(NDLI_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+
+      return ndliRes;
+    } catch (error) {
+      const causeCode = error?.cause?.code;
+      const retryable = isRetryableUpstreamError(error);
+
+      console.warn(`[${requestId}] /api/search: NDLI call failed`, {
+        message: error?.message,
+        name: error?.name,
+        causeCode,
+        upstreamDurationMs: Date.now() - upstreamStartMs,
+        attempt,
+        totalAttempts,
+        retryable,
+      });
+
+      if (!retryable || attempt >= totalAttempts) {
+        throw error;
+      }
+
+      await wait(NDLI_RETRY_DELAY_MS * attempt);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  throw new Error('NDLI request failed after retries');
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
@@ -108,34 +231,7 @@ app.post('/api/search', async (req, res) => {
     }
 
     const payload = new URLSearchParams({ query, domain });
-    const upstreamStartMs = Date.now();
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), NDLI_TIMEOUT_MS);
-
-    console.info(`[${requestId}] /api/search: forwarding to NDLI`, {
-      ndliUrl: NDLI_URL,
-      domain,
-    });
-
-    let ndliRes;
-    try {
-      ndliRes = await fetch(NDLI_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: payload,
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeoutId);
-    }
-
-    console.info(`[${requestId}] /api/search: NDLI responded`, {
-      status: ndliRes.status,
-      statusText: ndliRes.statusText,
-      upstreamDurationMs: Date.now() - upstreamStartMs,
-    });
+    const ndliRes = await fetchFromNdliWithRetry({ requestId, payload, domain });
 
     if (!ndliRes.ok) {
       console.error(`[${requestId}] /api/search: NDLI request failed`, {
@@ -219,6 +315,8 @@ function startServer() {
     console.log(`   Search proxy: POST http://localhost:${PORT}/api/search\n`);
     console.log(`   NDLI URL: ${NDLI_URL}`);
     console.log(`   NDLI timeout: ${NDLI_TIMEOUT_MS}ms`);
+    console.log(`   NDLI retries: ${NDLI_RETRY_COUNT}`);
+    console.log(`   NDLI retry delay: ${NDLI_RETRY_DELAY_MS}ms`);
     console.log(`   CORS origins: ${CORS_ORIGINS.join(', ')}\n`);
   });
 }

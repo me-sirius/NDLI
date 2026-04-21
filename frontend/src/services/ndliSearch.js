@@ -1,9 +1,12 @@
-// Frontend should only call backend URL from env (for example, ngrok URL).
+// Frontend prefers local backend when running locally and it is reachable.
 const API_BASE = (import.meta.env.VITE_API_URL || '').trim().replace(/\/$/, '');
+const LOCAL_API_BASE = (import.meta.env.VITE_LOCAL_API_URL || 'http://localhost:4000').trim().replace(/\/$/, '');
 const REQUEST_TIMEOUT_MS = parsePositiveInt(import.meta.env.VITE_REQUEST_TIMEOUT_MS, 32000);
 const HEALTHCHECK_TIMEOUT_MS = parsePositiveInt(import.meta.env.VITE_HEALTHCHECK_TIMEOUT_MS, 4500);
+const LOCAL_BACKEND_PING_TIMEOUT_MS = parsePositiveInt(import.meta.env.VITE_LOCAL_BACKEND_PING_TIMEOUT_MS, 850);
 const SEARCH_RETRY_COUNT = parseNonNegativeInt(import.meta.env.VITE_SEARCH_RETRY_COUNT, 1);
 const SEARCH_RETRY_DELAY_MS = parsePositiveInt(import.meta.env.VITE_SEARCH_RETRY_DELAY_MS, 400);
+const PREFER_LOCAL_BACKEND = parseBoolean(import.meta.env.VITE_PREFER_LOCAL_BACKEND, import.meta.env.DEV);
 const RETRYABLE_ERROR_CODES = new Set([
   'BACKEND_TIMEOUT',
   'BACKEND_UNREACHABLE',
@@ -22,6 +25,42 @@ function parseNonNegativeInt(value, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
 }
 
+function parseBoolean(value, fallback) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1' || normalized === 'yes') return true;
+    if (normalized === 'false' || normalized === '0' || normalized === 'no') return false;
+  }
+  return fallback;
+}
+
+function normalizeBaseUrl(url) {
+  return String(url || '').trim().replace(/\/$/, '');
+}
+
+function toApiInfo(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl);
+  const searchEndpoint = normalized ? `${normalized}/api/search` : '';
+  const healthEndpoint = normalized ? `${normalized}/health` : '';
+
+  let host = '';
+  if (normalized) {
+    try {
+      host = new URL(normalized).host;
+    } catch {
+      host = normalized;
+    }
+  }
+
+  return {
+    baseUrl: normalized,
+    host,
+    searchEndpoint,
+    healthEndpoint,
+  };
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -35,34 +74,36 @@ function createNdliError(message, code, extras = {}) {
 }
 
 export function getBackendApiInfo() {
-  const baseUrl = API_BASE;
-  const searchEndpoint = baseUrl ? `${baseUrl}/api/search` : '';
-  const healthEndpoint = baseUrl ? `${baseUrl}/health` : '';
-
-  let host = '';
-  if (baseUrl) {
-    try {
-      host = new URL(baseUrl).host;
-    } catch {
-      host = baseUrl;
-    }
-  }
-
-  return {
-    baseUrl,
-    host,
-    searchEndpoint,
-    healthEndpoint,
-  };
+  const preferredBase = (PREFER_LOCAL_BACKEND && LOCAL_API_BASE) ? LOCAL_API_BASE : (API_BASE || LOCAL_API_BASE);
+  return toApiInfo(preferredBase);
 }
 
-function getSearchEndpoint() {
-  const { searchEndpoint } = getBackendApiInfo();
-  if (!searchEndpoint) {
-    throw new Error('VITE_API_URL is missing. Set it in frontend/.env');
+async function isBackendHealthy(baseUrl, timeoutMs = HEALTHCHECK_TIMEOUT_MS) {
+  const { healthEndpoint } = toApiInfo(baseUrl);
+  if (!healthEndpoint) return false;
+
+  try {
+    const healthRes = await fetchWithTimeout(healthEndpoint, {
+      method: 'GET',
+      cache: 'no-store',
+    }, timeoutMs);
+
+    return healthRes.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveBackendApiInfo() {
+  if (PREFER_LOCAL_BACKEND && LOCAL_API_BASE) {
+    const localHealthy = await isBackendHealthy(LOCAL_API_BASE, LOCAL_BACKEND_PING_TIMEOUT_MS);
+    if (localHealthy) return toApiInfo(LOCAL_API_BASE);
   }
 
-  return searchEndpoint;
+  if (API_BASE) return toApiInfo(API_BASE);
+  if (LOCAL_API_BASE) return toApiInfo(LOCAL_API_BASE);
+
+  throw new Error('No backend URL configured. Set VITE_API_URL or VITE_LOCAL_API_URL.');
 }
 
 async function fetchWithTimeout(url, options, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -110,8 +151,8 @@ function shouldRetrySearchError(error) {
   return false;
 }
 
-async function diagnoseTypeError() {
-  const { healthEndpoint } = getBackendApiInfo();
+async function diagnoseTypeError(apiInfo) {
+  const { healthEndpoint } = apiInfo;
   if (!healthEndpoint) return 'BACKEND_CONFIG_MISSING';
 
   try {
@@ -140,8 +181,10 @@ async function diagnoseTypeError() {
 }
 
 async function runSearchRequest(query, domain = 'se') {
+  const apiInfo = await resolveBackendApiInfo();
+
   try {
-    const res = await fetchWithTimeout(getSearchEndpoint(), {
+    const res = await fetchWithTimeout(apiInfo.searchEndpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -187,7 +230,7 @@ async function runSearchRequest(query, domain = 'se') {
     }
 
     if (err.name === 'TypeError') {
-      const causeCode = await diagnoseTypeError();
+      const causeCode = await diagnoseTypeError(apiInfo);
 
       if (causeCode === 'CORS_BLOCKED') {
         throw createNdliError('Backend rejected this frontend origin (CORS). Add your frontend URL to CORS_ORIGINS and redeploy backend.', 'CORS_BLOCKED');

@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { fileURLToPath } from 'url';
-import { buildExtractiveOverview } from './summarizer.js';
+import { generateOverview } from './summarizer.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
@@ -246,9 +246,7 @@ app.post('/api/search', async (req, res) => {
     const raw = await ndliRes.json();
     const rows = Array.isArray(raw?.rows) ? raw.rows : [];
     const normalizedRows = rows.map(normalizeRow).filter((r) => r.title || r.desc);
-    const aiOverview = buildExtractiveOverview({
-      query,
-      rows: normalizedRows,
+    const aiSummary = await generateOverview(query, normalizedRows, {
       minSentences: 2,
       maxSentences: 4,
     });
@@ -257,13 +255,14 @@ app.post('/api/search', async (req, res) => {
       query,
       domain,
       count: normalizedRows.length,
-      aiOverview,
+      aiSummary,
+      aiOverview: aiSummary,
       rows: normalizedRows,
     });
 
     console.info(`[${requestId}] /api/search: response sent`, {
       resultCount: normalizedRows.length,
-      aiSentenceCount: aiOverview?.sentences?.length || 0,
+      aiSentenceCount: aiSummary?.sentences?.length || 0,
       totalDurationMs: Date.now() - startMs,
     });
   } catch (err) {

@@ -64,5 +64,9 @@ coverage/
 .temp/
 .tmp/
 
+# Local code history backups
+backend/history/
+*.backup.js
+
 # Internal docs (not for production)
 docs/INTERNAL_NDLI_PIPELINE_EXPLAINED.md

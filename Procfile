@@ -1,1 +1,0 @@
-web: cd embedding_service && uvicorn server:app --host 0.0.0.0 --port $PORT

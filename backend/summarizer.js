@@ -6,6 +6,7 @@ const MAX_SENTENCE_LENGTH = 320;
 const MAX_SENTENCES_PER_SOURCE = 2;
 const MAX_SOURCES = 4;
 const DEDUPE_SIMILARITY_THRESHOLD = 0.78;
+const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 
 const EMBEDDING_SERVICE_URL = (process.env.EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 const EMBEDDING_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.EMBEDDING_SERVICE_TIMEOUT_MS, 4500);
@@ -122,6 +123,37 @@ function sortByScoreThenPosition(a, b) {
   return a.sentenceIndex - b.sentenceIndex;
 }
 
+function clusterSentences(sentences, threshold = CLUSTER_SIMILARITY_THRESHOLD) {
+  const clusters = [];
+
+  sentences.forEach((sentence) => {
+    if (!Array.isArray(sentence.embedding) || sentence.embedding.length === 0) {
+      clusters.push([sentence]);
+      return;
+    }
+
+    let added = false;
+
+    for (const cluster of clusters) {
+      const anchor = cluster[0];
+      if (!Array.isArray(anchor.embedding) || anchor.embedding.length === 0) continue;
+
+      const similarity = cosineSimilarity(sentence.embedding, anchor.embedding);
+      if (similarity > threshold) {
+        cluster.push(sentence);
+        added = true;
+        break;
+      }
+    }
+
+    if (!added) {
+      clusters.push([sentence]);
+    }
+  });
+
+  return clusters;
+}
+
 function buildCandidates(rows) {
   const candidates = [];
   const seenSentences = new Set();
@@ -222,19 +254,14 @@ function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
 
   return candidates
     .map((candidate, index) => {
-      const sentencePosition = Number.isInteger(candidate.sentenceIndex)
-        ? candidate.sentenceIndex
-        : 3;
-      const semanticSimilarity = cosineSimilarity(
-        queryEmbedding,
-        embeddings[index + 1],
-      );
-      const semanticScore = clamp((semanticSimilarity + 1) / 2, 0, 1);
+      const sentenceEmbedding = embeddings[index + 1];
+      const semanticScore = cosineSimilarity(queryEmbedding, sentenceEmbedding);
       const keywordScore = keywordOverlapScore(queryText, candidate.text);
-      const structureScore = positionScore(sentencePosition);
+      const structureScore = positionScore(index);
 
       return {
         ...candidate,
+        embedding: sentenceEmbedding,
         score: clamp(
           0.6 * semanticScore
           + 0.25 * keywordScore
@@ -246,6 +273,29 @@ function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
       };
     })
     .sort(sortByScoreThenPosition);
+}
+
+function selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences) {
+  if (!scoredCandidates.length) return [];
+
+  const clusters = clusterSentences(scoredCandidates);
+  const representatives = clusters
+    .map((cluster) => {
+      cluster.sort(sortByScoreThenPosition);
+      return cluster[0];
+    })
+    .sort(sortByScoreThenPosition);
+
+  const selected = representatives.slice(0, Math.min(maxSentences, 3));
+  if (selected.length >= minSentences) return selected;
+
+  for (const candidate of scoredCandidates) {
+    if (selected.length >= minSentences || selected.length >= maxSentences) break;
+    if (selected.includes(candidate)) continue;
+    selected.push(candidate);
+  }
+
+  return selected;
 }
 
 function scoreCandidatesFallback(candidates) {
@@ -382,10 +432,13 @@ export async function generateOverview(query, rows, options = {}) {
 
   const texts = [queryText, ...candidates.map((candidate) => candidate.text)];
   const embeddings = await getEmbeddings(texts);
-  const scoredCandidates = embeddings
-    ? scoreCandidatesWithEmbeddings(queryText, candidates, embeddings)
-    : scoreCandidatesFallback(candidates);
+  if (embeddings) {
+    const scoredCandidates = scoreCandidatesWithEmbeddings(queryText, candidates, embeddings);
+    const selected = selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences);
+    return buildOverview(selected);
+  }
 
+  const scoredCandidates = scoreCandidatesFallback(candidates);
   const selected = selectBestSentences(scoredCandidates, minSentences, maxSentences);
   return buildOverview(selected);
 }

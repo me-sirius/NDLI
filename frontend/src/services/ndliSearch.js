@@ -73,6 +73,13 @@ function createNdliError(message, code, extras = {}) {
   return error;
 }
 
+function withApiInfo(extras, apiInfo) {
+  return {
+    ...extras,
+    apiInfo,
+  };
+}
+
 export function getBackendApiInfo() {
   const preferredBase = (PREFER_LOCAL_BACKEND && LOCAL_API_BASE) ? LOCAL_API_BASE : (API_BASE || LOCAL_API_BASE);
   return toApiInfo(preferredBase);
@@ -206,44 +213,78 @@ async function runSearchRequest(query, domain = 'se') {
       const classified = classifyBackendHttpError(res.status, message, details);
       if (classified) {
         throw createNdliError(classified.message, classified.code, {
-          status: res.status,
-          backendMessage: message,
-          details,
+          ...withApiInfo({
+            status: res.status,
+            backendMessage: message,
+            details,
+          }, apiInfo),
         });
       }
 
       throw createNdliError(`${message} (HTTP ${res.status})`, 'BACKEND_API_ERROR', {
-        status: res.status,
-        backendMessage: message,
-        details,
+        ...withApiInfo({
+          status: res.status,
+          backendMessage: message,
+          details,
+        }, apiInfo),
       });
     }
 
-    return res.json();
+    const data = await res.json();
+    if (data && typeof data === 'object') {
+      data._requestMeta = {
+        baseUrl: apiInfo.baseUrl,
+        host: apiInfo.host,
+        searchEndpoint: apiInfo.searchEndpoint,
+        healthEndpoint: apiInfo.healthEndpoint,
+      };
+    }
+
+    return data;
   } catch (err) {
     if (err?.code) {
       throw err;
     }
 
     if (err.name === 'AbortError') {
-      throw createNdliError(`Backend API did not respond within ${REQUEST_TIMEOUT_MS}ms.`, 'BACKEND_TIMEOUT');
+      throw createNdliError(
+        `Backend API did not respond within ${REQUEST_TIMEOUT_MS}ms.`,
+        'BACKEND_TIMEOUT',
+        withApiInfo({}, apiInfo),
+      );
     }
 
     if (err.name === 'TypeError') {
       const causeCode = await diagnoseTypeError(apiInfo);
 
       if (causeCode === 'CORS_BLOCKED') {
-        throw createNdliError('Backend rejected this frontend origin (CORS). Add your frontend URL to CORS_ORIGINS and redeploy backend.', 'CORS_BLOCKED');
+        throw createNdliError(
+          'Backend rejected this frontend origin (CORS). Add your frontend URL to CORS_ORIGINS and redeploy backend.',
+          'CORS_BLOCKED',
+          withApiInfo({}, apiInfo),
+        );
       }
 
       if (causeCode === 'BACKEND_SEARCH_ROUTE_ISSUE') {
-        throw createNdliError('Backend is reachable, but /api/search failed. Check backend logs and route deployment.', 'BACKEND_SEARCH_ROUTE_ISSUE');
+        throw createNdliError(
+          'Backend is reachable, but /api/search failed. Check backend logs and route deployment.',
+          'BACKEND_SEARCH_ROUTE_ISSUE',
+          withApiInfo({}, apiInfo),
+        );
       }
 
-      throw createNdliError('Unable to reach backend API from this network. Check backend URL/deployment and network path.', causeCode || 'BACKEND_UNREACHABLE');
+      throw createNdliError(
+        'Unable to reach backend API from this network. Check backend URL/deployment and network path.',
+        causeCode || 'BACKEND_UNREACHABLE',
+        withApiInfo({}, apiInfo),
+      );
     }
 
-    throw createNdliError(err?.message || 'Search failed. Please try again.', 'UNKNOWN_ERROR');
+    throw createNdliError(
+      err?.message || 'Search failed. Please try again.',
+      'UNKNOWN_ERROR',
+      withApiInfo({}, apiInfo),
+    );
   }
 }
 

@@ -91,6 +91,31 @@ function jaccardSimilarity(tokensA, tokensB) {
   return union === 0 ? 0 : intersection / union;
 }
 
+function keywordOverlapScore(query, sentence) {
+  const queryWords = String(query || '').toLowerCase().split(/\W+/).filter(Boolean);
+  if (!queryWords.length) return 0;
+
+  const sentenceWords = new Set(
+    String(sentence || '').toLowerCase().split(/\W+/).filter(Boolean),
+  );
+
+  let overlap = 0;
+  queryWords.forEach((word) => {
+    if (sentenceWords.has(word)) {
+      overlap += 1;
+    }
+  });
+
+  return overlap / queryWords.length;
+}
+
+function positionScore(index) {
+  if (index === 0) return 1.0;
+  if (index === 1) return 0.8;
+  if (index === 2) return 0.6;
+  return 0.4;
+}
+
 function sortByScoreThenPosition(a, b) {
   if (b.score !== a.score) return b.score - a.score;
   if (a.rowIndex !== b.rowIndex) return a.rowIndex - b.rowIndex;
@@ -192,28 +217,32 @@ async function getEmbeddings(texts) {
   }
 }
 
-function scoreCandidatesWithEmbeddings(candidates, embeddings) {
+function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
   const queryEmbedding = embeddings[0];
-  const rawScored = candidates.map((candidate, index) => ({
-    ...candidate,
-    rawSimilarity: cosineSimilarity(queryEmbedding, embeddings[index + 1]),
-    sentenceTokens: tokenize(candidate.text),
-  }));
 
-  const rawScores = rawScored.map((candidate) => candidate.rawSimilarity);
-  const minRaw = Math.min(...rawScores);
-  const maxRaw = Math.max(...rawScores);
-
-  return rawScored
-    .map((candidate) => {
-      const absolute = clamp((candidate.rawSimilarity + 1) / 2, 0, 1);
-      const relative = maxRaw > minRaw
-        ? (candidate.rawSimilarity - minRaw) / (maxRaw - minRaw)
-        : 0.5;
+  return candidates
+    .map((candidate, index) => {
+      const sentencePosition = Number.isInteger(candidate.sentenceIndex)
+        ? candidate.sentenceIndex
+        : 3;
+      const semanticSimilarity = cosineSimilarity(
+        queryEmbedding,
+        embeddings[index + 1],
+      );
+      const semanticScore = clamp((semanticSimilarity + 1) / 2, 0, 1);
+      const keywordScore = keywordOverlapScore(queryText, candidate.text);
+      const structureScore = positionScore(sentencePosition);
 
       return {
         ...candidate,
-        score: 0.55 * absolute + 0.45 * relative,
+        score: clamp(
+          0.6 * semanticScore
+          + 0.25 * keywordScore
+          + 0.15 * structureScore,
+          0,
+          1,
+        ),
+        sentenceTokens: tokenize(candidate.text),
       };
     })
     .sort(sortByScoreThenPosition);
@@ -354,7 +383,7 @@ export async function generateOverview(query, rows, options = {}) {
   const texts = [queryText, ...candidates.map((candidate) => candidate.text)];
   const embeddings = await getEmbeddings(texts);
   const scoredCandidates = embeddings
-    ? scoreCandidatesWithEmbeddings(candidates, embeddings)
+    ? scoreCandidatesWithEmbeddings(queryText, candidates, embeddings)
     : scoreCandidatesFallback(candidates);
 
   const selected = selectBestSentences(scoredCandidates, minSentences, maxSentences);

@@ -177,14 +177,15 @@ export default function Home() {
                 console.log('📦 NDLI API Response:', data);
 
                 const rows = data.rows || [];
+                const requestMeta = data && typeof data === 'object' ? data._requestMeta : null;
                 setResults(rows);
                 setActiveResultType('all');
                 setApiRequestState({
                     status: 'success',
                     at: Date.now(),
                     count: rows.length,
-                    endpoint: BACKEND_API_INFO.searchEndpoint || '/api/search',
-                    host: BACKEND_API_INFO.host || BACKEND_API_INFO.baseUrl || 'unknown-backend',
+                    endpoint: requestMeta?.searchEndpoint || BACKEND_API_INFO.searchEndpoint || '/api/search',
+                    host: requestMeta?.host || BACKEND_API_INFO.host || BACKEND_API_INFO.baseUrl || 'unknown-backend',
                     errorCode: null,
                 });
 
@@ -288,6 +289,7 @@ export default function Home() {
                 }
             } catch (err) {
                 console.error('❌ NDLI search failed:', err);
+                const errorApiInfo = err?.apiInfo;
                 setError(err.message || 'Search failed. Please try again.');
                 setResults([]);
                 setAiCard(null);
@@ -295,8 +297,8 @@ export default function Home() {
                     status: 'error',
                     at: Date.now(),
                     count: 0,
-                    endpoint: BACKEND_API_INFO.searchEndpoint || '/api/search',
-                    host: BACKEND_API_INFO.host || BACKEND_API_INFO.baseUrl || 'unknown-backend',
+                    endpoint: errorApiInfo?.searchEndpoint || BACKEND_API_INFO.searchEndpoint || '/api/search',
+                    host: errorApiInfo?.host || BACKEND_API_INFO.host || BACKEND_API_INFO.baseUrl || 'unknown-backend',
                     errorCode: typeof err?.code === 'string' ? err.code : 'UNKNOWN_ERROR',
                 });
             } finally {

@@ -1,3 +1,5 @@
+import 'dotenv/config';
+
 const SENTENCE_SPLIT_REGEX = /(?<=[.!?])\s+|\n+/g;
 const WORD_REGEX = /[a-z0-9]+/g;
 const MIN_SENTENCE_WORDS = 6;
@@ -119,6 +121,9 @@ function positionScore(index) {
 
 function sortByScoreThenPosition(a, b) {
   if (b.score !== a.score) return b.score - a.score;
+  const credibilityA = Number.isFinite(a?.credibilityScore) ? a.credibilityScore : 0;
+  const credibilityB = Number.isFinite(b?.credibilityScore) ? b.credibilityScore : 0;
+  if (credibilityB !== credibilityA) return credibilityB - credibilityA;
   if (a.rowIndex !== b.rowIndex) return a.rowIndex - b.rowIndex;
   return a.sentenceIndex - b.sentenceIndex;
 }
@@ -156,7 +161,27 @@ function clusterSentences(sentences, threshold = CLUSTER_SIMILARITY_THRESHOLD) {
 
 function buildCandidates(rows) {
   const candidates = [];
-  const seenSentences = new Set();
+  const sentenceIndexByHash = new Map();
+
+  function upsertCandidate(candidate) {
+    const sentenceHash = normalizeText(candidate?.text || '');
+    if (!sentenceHash) return;
+
+    const existingIndex = sentenceIndexByHash.get(sentenceHash);
+    if (existingIndex === undefined) {
+      sentenceIndexByHash.set(sentenceHash, candidates.length);
+      candidates.push(candidate);
+      return;
+    }
+
+    const existing = candidates[existingIndex];
+    const existingCredibility = sourceCredibilityScore(existing?.source);
+    const candidateCredibility = sourceCredibilityScore(candidate?.source);
+
+    if (candidateCredibility > existingCredibility) {
+      candidates[existingIndex] = candidate;
+    }
+  }
 
   rows.slice(0, CANDIDATE_ROW_LIMIT).forEach((row, rowIndex) => {
     const source = {
@@ -169,25 +194,17 @@ function buildCandidates(rows) {
     const titleTokenCount = tokenize(titleText).length;
 
     if (titleText.length >= 18 && titleTokenCount >= 6) {
-      const titleHash = normalizeText(titleText);
-      if (!seenSentences.has(titleHash)) {
-        seenSentences.add(titleHash);
-        candidates.push({
-          text: titleText,
-          rowIndex,
-          sentenceIndex: 0,
-          source,
-          fromTitle: true,
-        });
-      }
+      upsertCandidate({
+        text: titleText,
+        rowIndex,
+        sentenceIndex: 0,
+        source,
+        fromTitle: true,
+      });
     }
 
     splitSentences(row?.desc || '').forEach((sentence, sentenceIndex) => {
-      const sentenceHash = normalizeText(sentence);
-      if (!sentenceHash || seenSentences.has(sentenceHash)) return;
-
-      seenSentences.add(sentenceHash);
-      candidates.push({
+      upsertCandidate({
         text: sentence,
         rowIndex,
         sentenceIndex,
@@ -258,14 +275,17 @@ function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
       const semanticScore = cosineSimilarity(queryEmbedding, sentenceEmbedding);
       const keywordScore = keywordOverlapScore(queryText, candidate.text);
       const structureScore = positionScore(index);
+      const credibilityScore = sourceCredibilityScore(candidate.source);
 
       return {
         ...candidate,
         embedding: sentenceEmbedding,
+        credibilityScore,
         score: clamp(
-          0.6 * semanticScore
-          + 0.25 * keywordScore
-          + 0.15 * structureScore,
+          0.5 * semanticScore
+          + 0.2 * keywordScore
+          + 0.1 * structureScore
+          + 0.2 * credibilityScore,
           0,
           1,
         ),
@@ -275,7 +295,7 @@ function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
     .sort(sortByScoreThenPosition);
 }
 
-function selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences) {
+function selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences, intent = 'general') {
   if (!scoredCandidates.length) return [];
 
   const clusters = clusterSentences(scoredCandidates);
@@ -286,16 +306,47 @@ function selectClusterRepresentativeSentences(scoredCandidates, minSentences, ma
     })
     .sort(sortByScoreThenPosition);
 
-  const selected = representatives.slice(0, Math.min(maxSentences, 3));
-  if (selected.length >= minSentences) return selected;
+  const sortedRepresentatives = [...representatives].sort((a, b) => b.score - a.score);
+  const targetCount = clamp(intent === 'definition' ? 2 : 3, minSentences, maxSentences);
 
-  for (const candidate of scoredCandidates) {
-    if (selected.length >= minSentences || selected.length >= maxSentences) break;
+  let best;
+
+  if (intent === 'definition') {
+    best = sortedRepresentatives.slice(0, targetCount);
+  } else if (intent === 'timeline') {
+    best = sortedRepresentatives
+      .filter((sentence) => /\b\d{4}\b/.test(sentence.text))
+      .slice(0, targetCount);
+  } else if (intent === 'comparison') {
+    best = sortedRepresentatives
+      .filter((sentence) => {
+        const text = String(sentence.text || '').toLowerCase();
+        return text.includes('whereas') || text.includes('while') || text.includes('however');
+      })
+      .slice(0, targetCount);
+  } else if (intent === 'biography') {
+    best = sortedRepresentatives
+      .filter((sentence) => {
+        const text = String(sentence.text || '').toLowerCase();
+        return text.includes('born') || text.includes('was') || text.includes('leader');
+      })
+      .slice(0, targetCount);
+  } else {
+    best = sortedRepresentatives.slice(0, targetCount);
+  }
+
+  const selected = [...best];
+  if (selected.length >= targetCount) return selected;
+
+  const prioritized = prioritizeCandidatesForIntent(scoredCandidates, intent);
+
+  for (const candidate of prioritized) {
+    if (selected.length >= targetCount) break;
     if (selected.includes(candidate)) continue;
     selected.push(candidate);
   }
 
-  return selected;
+  return selected.slice(0, targetCount);
 }
 
 function scoreCandidatesFallback(candidates) {
@@ -306,29 +357,30 @@ function scoreCandidatesFallback(candidates) {
       const rowScore = maxRowIndex > 0 ? 1 - (candidate.rowIndex / (maxRowIndex + 1)) : 1;
       const positionBoost = candidate.sentenceIndex === 0 ? 0.12 : 0;
       const titleBoost = candidate.fromTitle ? 0.08 : 0;
+      const credibilityScore = sourceCredibilityScore(candidate.source);
+      const baseScore = clamp(0.4 + rowScore * 0.5 + positionBoost + titleBoost, 0, 1);
 
       return {
         ...candidate,
-        score: clamp(0.4 + rowScore * 0.5 + positionBoost + titleBoost, 0, 1),
+        credibilityScore,
+        score: clamp(0.8 * baseScore + 0.2 * credibilityScore, 0, 1),
         sentenceTokens: tokenize(candidate.text),
       };
     })
     .sort(sortByScoreThenPosition);
 }
 
-function selectBestSentences(scoredCandidates, minSentences, maxSentences) {
+function selectBestSentences(scoredCandidates, minSentences, maxSentences, intent = 'general') {
   if (!scoredCandidates.length) return [];
 
-  const targetCount = Math.min(
-    maxSentences,
-    Math.max(minSentences, scoredCandidates.length > 10 ? 4 : 3),
-  );
+  const targetCount = clamp(intent === 'definition' ? 2 : 3, minSentences, maxSentences);
+  const prioritized = prioritizeCandidatesForIntent(scoredCandidates, intent);
 
   const selected = [];
   const sourceCounter = new Map();
   const sourcePool = new Set();
 
-  for (const candidate of scoredCandidates) {
+  for (const candidate of prioritized) {
     if (selected.length >= targetCount) break;
 
     const key = sourceKey(candidate.source);
@@ -348,9 +400,9 @@ function selectBestSentences(scoredCandidates, minSentences, maxSentences) {
     sourcePool.add(key);
   }
 
-  if (selected.length < minSentences) {
-    for (const candidate of scoredCandidates) {
-      if (selected.length >= minSentences) break;
+  if (selected.length < targetCount) {
+    for (const candidate of prioritized) {
+      if (selected.length >= targetCount) break;
       if (selected.includes(candidate)) continue;
 
       const key = sourceKey(candidate.source);
@@ -366,7 +418,11 @@ function selectBestSentences(scoredCandidates, minSentences, maxSentences) {
     }
   }
 
-  return selected.slice(0, maxSentences);
+  if (selected.length < minSentences) {
+    return selected.slice(0, minSentences);
+  }
+
+  return selected.slice(0, targetCount);
 }
 
 function scoreToConfidence(score) {
@@ -415,6 +471,79 @@ function buildOverview(selectedSentences) {
   };
 }
 
+function sourceCredibilityScore(source) {
+  const title = typeof source === 'string' ? source : source?.title;
+  const t = String(title || '').toLowerCase();
+
+  if (t.includes('journal')) return 1.0;
+  if (t.includes('research')) return 1.0;
+  if (t.includes('conference')) return 0.95;
+
+  if (t.includes('textbook')) return 0.9;
+  if (t.includes('lecture')) return 0.85;
+
+  if (t.includes('government')) return 0.95;
+  if (t.includes('standard')) return 0.95;
+
+  if (t.includes('archive')) return 0.8;
+
+  return 0.7;
+}
+
+function detectIntent(query) {
+  const q = String(query || '').toLowerCase().trim();
+
+  if (q.startsWith('what is') || q.startsWith('define')) {
+    return 'definition';
+  }
+
+  if (q.includes('timeline') || q.includes('history of')) {
+    return 'timeline';
+  }
+
+  if (q.includes('difference between') || q.includes('compare')) {
+    return 'comparison';
+  }
+
+  if (q.startsWith('who is') || q.startsWith('who was')) {
+    return 'biography';
+  }
+
+  return 'general';
+}
+
+function prioritizeCandidatesForIntent(scoredCandidates, intent) {
+  if (!Array.isArray(scoredCandidates) || scoredCandidates.length === 0) return [];
+
+  if (intent !== 'timeline' && intent !== 'comparison' && intent !== 'biography') {
+    return scoredCandidates;
+  }
+
+  const matches = [];
+  const others = [];
+
+  for (const candidate of scoredCandidates) {
+    const text = String(candidate?.text || '').toLowerCase();
+
+    let isMatch = false;
+    if (intent === 'timeline') {
+      isMatch = /\b\d{4}\b/.test(candidate?.text || '');
+    } else if (intent === 'comparison') {
+      isMatch = text.includes('whereas') || text.includes('while') || text.includes('however');
+    } else if (intent === 'biography') {
+      isMatch = text.includes('born') || text.includes('was') || text.includes('leader');
+    }
+
+    if (isMatch) {
+      matches.push(candidate);
+    } else {
+      others.push(candidate);
+    }
+  }
+
+  return matches.concat(others);
+}
+
 export async function generateOverview(query, rows, options = {}) {
   const queryText = String(query || '').trim();
   const safeRows = Array.isArray(rows) ? rows : [];
@@ -422,6 +551,7 @@ export async function generateOverview(query, rows, options = {}) {
   const requestedMax = parsePositiveInt(options.maxSentences, 4);
   const minSentences = Math.min(requestedMin, requestedMax);
   const maxSentences = Math.max(requestedMin, requestedMax);
+  const intent = detectIntent(queryText);
 
   if (!queryText || !safeRows.length) {
     return null;
@@ -434,11 +564,11 @@ export async function generateOverview(query, rows, options = {}) {
   const embeddings = await getEmbeddings(texts);
   if (embeddings) {
     const scoredCandidates = scoreCandidatesWithEmbeddings(queryText, candidates, embeddings);
-    const selected = selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences);
+    const selected = selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences, intent);
     return buildOverview(selected);
   }
 
   const scoredCandidates = scoreCandidatesFallback(candidates);
-  const selected = selectBestSentences(scoredCandidates, minSentences, maxSentences);
+  const selected = selectBestSentences(scoredCandidates, minSentences, maxSentences, intent);
   return buildOverview(selected);
 }

@@ -32,9 +32,29 @@ def build_prompt(context: str, query: str | None, intent: str | None) -> str:
     safe_query = (query or "").strip()
     safe_intent = (intent or "general").strip()
 
+    intent_guidance = ""
+    if safe_intent == "definition":
+        intent_guidance = (
+            "Start with a one-sentence definition, then explain key aspects and significance. "
+        )
+    elif safe_intent == "timeline":
+        intent_guidance = (
+            "Present events in chronological order and include dates only if present in the sources. "
+        )
+    elif safe_intent == "comparison":
+        intent_guidance = (
+            "Compare the items clearly by stating 2–4 concrete differences or contrasts supported by the sources. "
+        )
+    elif safe_intent == "biography":
+        intent_guidance = (
+            "Explain who the person is, key roles/contributions, and relevant time period supported by the sources. "
+        )
+
     header = (
-        "You are an academic assistant. Write a concise, factual overview grounded ONLY in the provided sources. "
-        "Avoid adding facts not present in the sources."
+        "You are an academic assistant. Write a clear, well-structured overview grounded ONLY in the provided sources. "
+        "Write 5–7 sentences (about 120–180 words) as a single paragraph. "
+        + intent_guidance
+        + "Do not add facts not present in the sources. Do not use bullet points. Do not include citations like [1]."
     )
 
     if safe_query:
@@ -46,9 +66,16 @@ def build_prompt(context: str, query: str | None, intent: str | None) -> str:
     return header + context
 
 
-def generate_summary(context: str, query: str | None = None, intent: str | None = None, max_new_tokens: int = 200) -> str:
-    prompt = build_prompt(context=context, query=query, intent=intent)
+def _is_too_short(summary: str) -> bool:
+    words = [w for w in str(summary or "").split() if w]
+    if len(words) < 55:
+        return True
 
+    sentence_marks = sum(str(summary).count(ch) for ch in [".", "!", "?"])
+    return sentence_marks < 2
+
+
+def _generate_once(prompt: str, max_new_tokens: int, length_penalty: float) -> str:
     inputs = summary_tokenizer(
         prompt,
         return_tensors="pt",
@@ -62,11 +89,29 @@ def generate_summary(context: str, query: str | None = None, intent: str | None 
             **inputs,
             max_new_tokens=max_new_tokens,
             num_beams=4,
-            length_penalty=1.0,
+            length_penalty=length_penalty,
+            no_repeat_ngram_size=3,
             early_stopping=True,
         )
 
     return summary_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+
+
+def generate_summary(context: str, query: str | None = None, intent: str | None = None, max_new_tokens: int = 240) -> str:
+    prompt = build_prompt(context=context, query=query, intent=intent)
+    summary = _generate_once(prompt, max_new_tokens=max_new_tokens, length_penalty=1.15)
+
+    if _is_too_short(summary):
+        longer_prompt = prompt + "\n\nWrite a longer overview (6–9 sentences, about 160–220 words)."
+        summary_retry = _generate_once(
+            longer_prompt,
+            max_new_tokens=max(max_new_tokens, 320),
+            length_penalty=1.25,
+        )
+        if len(summary_retry) > len(summary):
+            summary = summary_retry
+
+    return summary.strip()
 
 
 @app.post("/embed")
@@ -82,7 +127,7 @@ def summarize(req: SummarizeRequest):
         combined_context,
         query=req.query,
         intent=req.intent,
-        max_new_tokens=req.max_new_tokens or 200,
+        max_new_tokens=req.max_new_tokens or 240,
     )
     return {"summary": summary}
 

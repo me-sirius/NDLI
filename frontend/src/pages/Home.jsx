@@ -103,6 +103,15 @@ function resultTypeLabel(typeKey) {
         .join(' ');
 }
 
+    function normalizeAiSummaryText(value) {
+        return String(value || '')
+        .toLowerCase()
+        .replace(/\[\d+\]/g, '')
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
 // ─── Skeleton loading components ─────────────────────────────────────────────
 const AISkeleton = () => (
     <div className="ai-card-border p-6 mb-8 animate-fade-in-up">
@@ -568,41 +577,64 @@ export default function Home() {
                                 </span>
                             </div>
 
-                            {Array.isArray(aiCard?.sentenceDetails) && aiCard.sentenceDetails.length ? (
-                                <ul className="space-y-2.5">
-                                    {aiCard.sentenceDetails.map((sentence, idx) => (
-                                        <li key={`ai-sentence-${idx}`} className="text-[15px] text-slate-700 leading-relaxed flex items-start gap-2">
-                                            <span className="text-[#0b57d0] mt-0.5">•</span>
-                                            <span className="flex-1">
-                                                <span>{sentence.text}</span>
-                                                {sentence.citation && (
-                                                    <span className="ml-1 text-[11px] font-bold text-[#0b57d0] align-middle">
-                                                        {sentence.citation}
-                                                    </span>
-                                                )}
-                                            </span>
-                                            {typeof sentence.confidence === 'number' && (
-                                                <span className="shrink-0 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-bold text-sky-700">
-                                                    {Math.round(sentence.confidence * 100)}%
-                                                </span>
-                                            )}
-                                        </li>
-                                    ))}
-                                </ul>
-                            ) : Array.isArray(aiCard?.sentences) && aiCard.sentences.length ? (
-                                <ul className="space-y-2.5">
-                                    {aiCard.sentences.map((sentence, idx) => (
-                                        <li key={`ai-sentence-fallback-${idx}`} className="text-[15px] text-slate-700 leading-relaxed flex items-start gap-2">
-                                            <span className="text-[#0b57d0] mt-0.5">•</span>
-                                            <span>{sentence}</span>
-                                        </li>
-                                    ))}
-                                </ul>
-                            ) : (
-                                <p className="text-[15px] text-slate-700 leading-relaxed">
-                                    {aiCard.snippet}
-                                </p>
-                            )}
+                            {(() => {
+                                const hasSentenceDetails = Array.isArray(aiCard?.sentenceDetails) && aiCard.sentenceDetails.length;
+                                const hasSentences = Array.isArray(aiCard?.sentences) && aiCard.sentences.length;
+
+                                const evidenceText = hasSentenceDetails
+                                    ? aiCard.sentenceDetails.map((item) => item.text).join(' ')
+                                    : (hasSentences ? aiCard.sentences.join(' ') : '');
+
+                                const normalizedSnippet = normalizeAiSummaryText(aiCard?.snippet);
+                                const normalizedEvidence = normalizeAiSummaryText(evidenceText);
+                                const showNarrative = Boolean(normalizedSnippet && normalizedEvidence && normalizedSnippet !== normalizedEvidence);
+
+                                return (
+                                    <>
+                                        {(showNarrative || (!hasSentenceDetails && !hasSentences)) && (
+                                            <p className="text-[15px] text-slate-700 leading-relaxed">
+                                                {aiCard.snippet}
+                                            </p>
+                                        )}
+
+                                        {hasSentenceDetails ? (
+                                            <div className={showNarrative ? 'mt-4 pt-4 border-t border-slate-100' : ''}>
+                                                <ul className="space-y-2.5">
+                                                    {aiCard.sentenceDetails.map((sentence, idx) => (
+                                                        <li key={`ai-sentence-${idx}`} className="text-[15px] text-slate-700 leading-relaxed flex items-start gap-2">
+                                                            <span className="text-[#0b57d0] mt-0.5">•</span>
+                                                            <span className="flex-1">
+                                                                <span>{sentence.text}</span>
+                                                                {sentence.citation && (
+                                                                    <span className="ml-1 text-[11px] font-bold text-[#0b57d0] align-middle">
+                                                                        {sentence.citation}
+                                                                    </span>
+                                                                )}
+                                                            </span>
+                                                            {typeof sentence.confidence === 'number' && (
+                                                                <span className="shrink-0 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-bold text-sky-700">
+                                                                    {Math.round(sentence.confidence * 100)}%
+                                                                </span>
+                                                            )}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+                                        ) : hasSentences ? (
+                                            <div className={showNarrative ? 'mt-4 pt-4 border-t border-slate-100' : ''}>
+                                                <ul className="space-y-2.5">
+                                                    {aiCard.sentences.map((sentence, idx) => (
+                                                        <li key={`ai-sentence-fallback-${idx}`} className="text-[15px] text-slate-700 leading-relaxed flex items-start gap-2">
+                                                            <span className="text-[#0b57d0] mt-0.5">•</span>
+                                                            <span>{sentence}</span>
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+                                        ) : null}
+                                    </>
+                                );
+                            })()}
 
                             <div className="mt-5 pt-4 border-t border-slate-100">
                                 <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Sources</p>

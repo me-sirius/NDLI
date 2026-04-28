@@ -12,9 +12,9 @@ const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 
 const EMBEDDING_SERVICE_URL = (process.env.EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 const EMBEDDING_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.EMBEDDING_SERVICE_TIMEOUT_MS, 4500);
-const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 8500);
-const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 10);
-const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 220);
+const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 20000);
+const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 12);
+const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 280);
 const ENABLE_GENERATIVE_OVERVIEW = String(process.env.AI_OVERVIEW_GENERATIVE || 'true').toLowerCase() !== 'false';
 const CANDIDATE_ROW_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_MAX_ROWS, 15);
 
@@ -598,14 +598,12 @@ function buildOverview(selectedSentences) {
 }
 
 function buildGenerativeOverview(narrativeSummary, evidenceSentences) {
-  const { sources } = buildSourcesFromEvidence(evidenceSentences);
+  const evidenceOverview = buildOverview(evidenceSentences);
 
   return {
+    ...evidenceOverview,
     snippet: narrativeSummary,
     snippetWithCitations: narrativeSummary,
-    sentences: [],
-    sentenceDetails: [],
-    sources,
   };
 }
 

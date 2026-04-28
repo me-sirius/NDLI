@@ -2,3 +2,5 @@ fastapi
 uvicorn
 sentence-transformers
 torch
+transformers
+sentencepiece

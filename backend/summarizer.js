@@ -12,7 +12,14 @@ const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 
 const EMBEDDING_SERVICE_URL = (process.env.EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 const EMBEDDING_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.EMBEDDING_SERVICE_TIMEOUT_MS, 4500);
+const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 8500);
+const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 10);
+const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 220);
+const ENABLE_GENERATIVE_OVERVIEW = String(process.env.AI_OVERVIEW_GENERATIVE || 'true').toLowerCase() !== 'false';
 const CANDIDATE_ROW_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_MAX_ROWS, 15);
+
+let summarizeCapabilityKnown = false;
+let summarizeCapabilityAvailable = false;
 
 const STOP_WORDS = new Set([
   'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 'have', 'in', 'is', 'it',
@@ -157,6 +164,29 @@ function clusterSentences(sentences, threshold = CLUSTER_SIMILARITY_THRESHOLD) {
   });
 
   return clusters;
+}
+
+function buildSourcesFromEvidence(selectedSentences) {
+  const sourceRefByKey = new Map();
+  const sources = [];
+
+  for (const item of selectedSentences || []) {
+    const key = sourceKey(item?.source);
+    if (!key) continue;
+
+    if (!sourceRefByKey.has(key)) {
+      const ref = sources.length + 1;
+      sourceRefByKey.set(key, ref);
+      sources.push({
+        ...item.source,
+        ref,
+      });
+
+      if (sources.length >= MAX_SOURCES) break;
+    }
+  }
+
+  return { sources, sourceRefByKey };
 }
 
 function buildCandidates(rows) {
@@ -370,6 +400,102 @@ function scoreCandidatesFallback(candidates) {
     .sort(sortByScoreThenPosition);
 }
 
+function pickEvidenceSentences(scoredCandidates, intent, maxEvidence) {
+  const target = Math.max(1, Number(maxEvidence) || 0);
+  const prioritized = prioritizeCandidatesForIntent(scoredCandidates, intent);
+
+  const evidence = [];
+  const sourceCounter = new Map();
+  const sourcePool = new Set();
+
+  for (const candidate of prioritized) {
+    if (evidence.length >= target) break;
+
+    const key = sourceKey(candidate.source);
+    const sourceCount = sourceCounter.get(key) || 0;
+    const introducesNewSource = !sourcePool.has(key);
+
+    if (sourceCount >= MAX_SENTENCES_PER_SOURCE) continue;
+    if (introducesNewSource && sourcePool.size >= MAX_SOURCES) continue;
+
+    if (!Array.isArray(candidate.sentenceTokens)) {
+      candidate.sentenceTokens = tokenize(candidate.text);
+    }
+
+    const tooSimilar = evidence.some((picked) => (
+      jaccardSimilarity(candidate.sentenceTokens, picked.sentenceTokens) >= DEDUPE_SIMILARITY_THRESHOLD
+    ));
+    if (tooSimilar) continue;
+
+    evidence.push(candidate);
+    sourceCounter.set(key, sourceCount + 1);
+    sourcePool.add(key);
+  }
+
+  return evidence;
+}
+
+async function generateNarrativeSummary({ queryText, intent, evidenceSentences }) {
+  if (!ENABLE_GENERATIVE_OVERVIEW) return null;
+  if (!Array.isArray(evidenceSentences) || evidenceSentences.length === 0) return null;
+  if (summarizeCapabilityKnown && !summarizeCapabilityAvailable) return null;
+
+  const { sources, sourceRefByKey } = buildSourcesFromEvidence(evidenceSentences);
+
+  const contextLines = [];
+  for (const source of sources) {
+    contextLines.push(`[${source.ref}] ${source.title} — ${source.author} — ${source.url}`);
+  }
+
+  for (const item of evidenceSentences) {
+    const key = sourceKey(item.source);
+    const ref = sourceRefByKey.get(key);
+    contextLines.push(`[${ref || 0}] ${item.text}`);
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), SUMMARIZE_SERVICE_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${EMBEDDING_SERVICE_URL}/summarize`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        texts: contextLines,
+        query: queryText,
+        intent,
+        max_new_tokens: RAG_MAX_NEW_TOKENS,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        summarizeCapabilityKnown = true;
+        summarizeCapabilityAvailable = false;
+      }
+      throw new Error(`Summarization failed with status ${response.status}`);
+    }
+
+    const data = await response.json();
+    const summary = String(data?.summary || '').trim();
+
+    summarizeCapabilityKnown = true;
+    summarizeCapabilityAvailable = true;
+    return summary || null;
+  } catch (error) {
+    console.warn('[summarizer] narrative summarization failed, falling back to extractive overview', {
+      message: error?.message,
+      serviceUrl: EMBEDDING_SERVICE_URL,
+    });
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function selectBestSentences(scoredCandidates, minSentences, maxSentences, intent = 'general') {
   if (!scoredCandidates.length) return [];
 
@@ -471,6 +597,18 @@ function buildOverview(selectedSentences) {
   };
 }
 
+function buildGenerativeOverview(narrativeSummary, evidenceSentences) {
+  const { sources } = buildSourcesFromEvidence(evidenceSentences);
+
+  return {
+    snippet: narrativeSummary,
+    snippetWithCitations: narrativeSummary,
+    sentences: [],
+    sentenceDetails: [],
+    sources,
+  };
+}
+
 function sourceCredibilityScore(source) {
   const title = typeof source === 'string' ? source : source?.title;
   const t = String(title || '').toLowerCase();
@@ -564,11 +702,25 @@ export async function generateOverview(query, rows, options = {}) {
   const embeddings = await getEmbeddings(texts);
   if (embeddings) {
     const scoredCandidates = scoreCandidatesWithEmbeddings(queryText, candidates, embeddings);
+
+    const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT);
+    const narrativeSummary = await generateNarrativeSummary({ queryText, intent, evidenceSentences });
+    if (narrativeSummary) {
+      return buildGenerativeOverview(narrativeSummary, evidenceSentences);
+    }
+
     const selected = selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences, intent);
     return buildOverview(selected);
   }
 
   const scoredCandidates = scoreCandidatesFallback(candidates);
+
+  const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT);
+  const narrativeSummary = await generateNarrativeSummary({ queryText, intent, evidenceSentences });
+  if (narrativeSummary) {
+    return buildGenerativeOverview(narrativeSummary, evidenceSentences);
+  }
+
   const selected = selectBestSentences(scoredCandidates, minSentences, maxSentences, intent);
   return buildOverview(selected);
 }

@@ -13,9 +13,9 @@ const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 
 const EMBEDDING_SERVICE_URL = (process.env.EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 const EMBEDDING_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.EMBEDDING_SERVICE_TIMEOUT_MS, 4500);
-const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 20000);
+const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 45000);
 const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 16);
-const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 280);
+const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 400);
 const ALIGNMENT_SCORE_THRESHOLD = parsePositiveNumber(process.env.AI_OVERVIEW_ALIGNMENT_THRESHOLD, 0.55);
 const ENABLE_GENERATIVE_OVERVIEW = String(process.env.AI_OVERVIEW_GENERATIVE || 'true').toLowerCase() !== 'false';
 const CANDIDATE_ROW_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_MAX_ROWS, 20);
@@ -619,7 +619,22 @@ function pickEvidenceSentences(scoredCandidates, intent, maxEvidence, queryText)
   const prioritized = prioritizeCandidatesForIntent(scoredCandidates, intent);
   const resourceQuery = isResourceQuery(queryText);
 
-  const anchorTokens = computeAnchorTokens(queryText, prioritized);
+  // Phase 10: Diversify Evidence Selection
+  let diversifiedPrioritized = [];
+  if (prioritized.length >= 16) {
+    diversifiedPrioritized = [
+      ...prioritized.slice(0, 4),
+      ...prioritized.slice(6, 10),
+      ...prioritized.slice(12, 16),
+      ...prioritized.slice(4, 6),
+      ...prioritized.slice(10, 12),
+      ...prioritized.slice(16)
+    ];
+  } else {
+    diversifiedPrioritized = prioritized;
+  }
+
+  const anchorTokens = computeAnchorTokens(queryText, diversifiedPrioritized);
 
   function candidateMatchesAnchors(candidate) {
     if (!anchorTokens.length) return true;
@@ -641,7 +656,7 @@ function pickEvidenceSentences(scoredCandidates, intent, maxEvidence, queryText)
     const sourceCounter = new Map();
     const sourcePool = new Set();
 
-    for (const candidate of prioritized) {
+    for (const candidate of diversifiedPrioritized) {
       if (evidence.length >= target) break;
       if (!allowTitles && candidate.fromTitle) continue;
       if (enforceAnchors && !candidateMatchesAnchors(candidate)) continue;

@@ -57,13 +57,17 @@ def build_prompt(context: str, query: str | None, intent: str | None) -> str:
         )
 
     header = (
-        "You are an academic assistant. Write a clear, well-structured overview grounded ONLY in the provided sources. "
-        "Write 6–9 sentences (about 160–240 words) as a single paragraph. "
+        "Explain the topic in structured academic format.\n\n"
+        "Return output using exactly this structure (include the headings):\n\n"
+        "Definition:\n"
+        "Process:\n"
+        "Key Stages:\n"
+        "Importance:\n\n"
+        "Write concise educational paragraphs under each section based ONLY on the provided sources.\n"
         + intent_guidance
         + "Do not add facts not present in the sources. Do not use bullet points. Do not include citations like [1]. "
-        + "Return only the final summary paragraph; do not echo labels like 'Query', 'Intent', or 'Sources (evidence)'. "
-        + "When possible, cover: definition, core mechanism or steps, key inputs/outputs, and why it matters. "
-        + "If a component is not supported by the sources, omit it."
+        + "Do not echo the 'Query' or 'Intent' labels.\n"
+        + "If an aspect is not supported by the sources, write 'Not covered in sources.'"
     )
 
     if safe_query:
@@ -106,15 +110,15 @@ def _generate_once(prompt: str, max_new_tokens: int, length_penalty: float) -> s
     return summary_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
 
-def generate_summary(context: str, query: str | None = None, intent: str | None = None, max_new_tokens: int = 240) -> str:
+def generate_summary(context: str, query: str | None = None, intent: str | None = None, max_new_tokens: int = 600) -> str:
     prompt = build_prompt(context=context, query=query, intent=intent)
     summary = _generate_once(prompt, max_new_tokens=max_new_tokens, length_penalty=1.15)
 
     if _is_too_short(summary):
-        longer_prompt = prompt + "\n\nWrite a longer overview (6–9 sentences, about 160–220 words)."
+        longer_prompt = prompt + "\n\nEnsure a longer Overview is produced covering all sections."
         summary_retry = _generate_once(
             longer_prompt,
-            max_new_tokens=max(max_new_tokens, 320),
+            max_new_tokens=max(max_new_tokens, 600),
             length_penalty=1.25,
         )
         if len(summary_retry) > len(summary):
@@ -136,7 +140,7 @@ def summarize(req: SummarizeRequest):
         combined_context,
         query=req.query,
         intent=req.intent,
-        max_new_tokens=req.max_new_tokens or 240,
+        max_new_tokens=req.max_new_tokens or 600,
     )
     return {"summary": summary}
 

@@ -103,6 +103,31 @@ function resultTypeLabel(typeKey) {
         .join(' ');
 }
 
+function summarizerBadgeConfig(status) {
+    switch (status) {
+        case 'up':
+            return {
+                label: 'Summarizer: Up',
+                className: 'text-sky-700 bg-sky-50 border-sky-100',
+            };
+        case 'down':
+            return {
+                label: 'Summarizer: Down',
+                className: 'text-rose-700 bg-rose-50 border-rose-100',
+            };
+        case 'disabled':
+            return {
+                label: 'Summarizer: Off',
+                className: 'text-slate-600 bg-slate-100 border-slate-200',
+            };
+        default:
+            return {
+                label: 'Summarizer: Unknown',
+                className: 'text-slate-500 bg-slate-100 border-slate-200',
+            };
+    }
+}
+
     function normalizeAiSummaryText(value) {
         return String(value || '')
         .toLowerCase()
@@ -160,6 +185,7 @@ export default function Home() {
     const [retryTick, setRetryTick] = useState(0);
     const [activeResultType, setActiveResultType] = useState('all');
     const [apiRequestState, setApiRequestState] = useState(null);
+    const [alwaysShowNarrative, setAlwaysShowNarrative] = useState(false);
     const inputRef = useRef(null);
 
     // Debounced NDLI search
@@ -206,6 +232,7 @@ export default function Home() {
                 }));
 
                 const backendOverview = data.aiOverview;
+                const backendMeta = backendOverview?.meta || null;
                 const backendSentenceDetails = Array.isArray(backendOverview?.sentenceDetails)
                     ? backendOverview.sentenceDetails
                         .map((item) => {
@@ -270,6 +297,7 @@ export default function Home() {
                         sentences: backendSentences,
                         sentenceDetails,
                         sources: backendSources,
+                        summarizerStatus: backendMeta?.summarizer || 'unknown',
                     });
                 } else if (rows.length) {
                     const fallbackSnippet = rows.map(r => r.desc || r.title).slice(0, 3).join(' ');
@@ -292,6 +320,7 @@ export default function Home() {
                             };
                         }),
                         sources: fallbackSources,
+                        summarizerStatus: backendMeta?.summarizer || 'unknown',
                     });
                 } else {
                     setAiCard(null);
@@ -567,14 +596,33 @@ export default function Home() {
                 {aiCard && !loading && (
                     <section className="ai-card-border mt-6 mb-8 animate-fade-in-up" aria-labelledby="ai-overview-heading">
                         <div className="p-6">
-                            <div className="flex items-center gap-2.5 mb-4">
+                            <div className="flex flex-wrap items-center gap-2.5 mb-4">
                                 <div className="w-8 h-8 rounded-xl bg-[#0b57d0] text-white flex items-center justify-center shadow-sm shadow-blue-500/25">
                                     <SparklesIcon className="w-4 h-4" />
                                 </div>
                                 <h2 id="ai-overview-heading" className="text-base font-bold text-slate-900">AI Overview</h2>
-                                <span className="text-[10px] font-bold text-[#0b57d0] bg-blue-50 px-2 py-0.5 rounded-full border border-blue-100 uppercase tracking-wider">
-                                    Preview
-                                </span>
+                                <div className="ml-auto flex flex-wrap items-center gap-2">
+                                    <span className="text-[10px] font-bold text-[#0b57d0] bg-blue-50 px-2 py-0.5 rounded-full border border-blue-100 uppercase tracking-wider">
+                                        Preview
+                                    </span>
+                                    {(() => {
+                                        const badge = summarizerBadgeConfig(aiCard?.summarizerStatus);
+                                        return (
+                                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border uppercase tracking-wider ${badge.className}`}>
+                                                {badge.label}
+                                            </span>
+                                        );
+                                    })()}
+                                    <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-600">
+                                        <input
+                                            type="checkbox"
+                                            checked={alwaysShowNarrative}
+                                            onChange={(event) => setAlwaysShowNarrative(event.target.checked)}
+                                            className="h-4 w-4 rounded border-slate-300 text-[#0b57d0] focus:ring-[#0b57d0]"
+                                        />
+                                        Always show paragraph
+                                    </label>
+                                </div>
                             </div>
 
                             {(() => {
@@ -588,17 +636,20 @@ export default function Home() {
                                 const normalizedSnippet = normalizeAiSummaryText(aiCard?.snippet);
                                 const normalizedEvidence = normalizeAiSummaryText(evidenceText);
                                 const showNarrative = Boolean(normalizedSnippet && normalizedEvidence && normalizedSnippet !== normalizedEvidence);
+                                const shouldShowNarrative = alwaysShowNarrative
+                                    ? Boolean(normalizedSnippet)
+                                    : showNarrative;
 
                                 return (
                                     <>
-                                        {(showNarrative || (!hasSentenceDetails && !hasSentences)) && (
+                                        {(shouldShowNarrative || (!hasSentenceDetails && !hasSentences)) && (
                                             <p className="text-[15px] text-slate-700 leading-relaxed">
                                                 {aiCard.snippet}
                                             </p>
                                         )}
 
                                         {hasSentenceDetails ? (
-                                            <div className={showNarrative ? 'mt-4 pt-4 border-t border-slate-100' : ''}>
+                                            <div className={shouldShowNarrative ? 'mt-4 pt-4 border-t border-slate-100' : ''}>
                                                 <ul className="space-y-2.5">
                                                     {aiCard.sentenceDetails.map((sentence, idx) => (
                                                         <li key={`ai-sentence-${idx}`} className="text-[15px] text-slate-700 leading-relaxed flex items-start gap-2">
@@ -621,7 +672,7 @@ export default function Home() {
                                                 </ul>
                                             </div>
                                         ) : hasSentences ? (
-                                            <div className={showNarrative ? 'mt-4 pt-4 border-t border-slate-100' : ''}>
+                                            <div className={shouldShowNarrative ? 'mt-4 pt-4 border-t border-slate-100' : ''}>
                                                 <ul className="space-y-2.5">
                                                     {aiCard.sentences.map((sentence, idx) => (
                                                         <li key={`ai-sentence-fallback-${idx}`} className="text-[15px] text-slate-700 leading-relaxed flex items-start gap-2">

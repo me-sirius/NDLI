@@ -4,8 +4,9 @@ const SENTENCE_SPLIT_REGEX = /(?<=[.!?])\s+|\n+/g;
 const WORD_REGEX = /[a-z0-9]+/g;
 const MIN_SENTENCE_WORDS = 6;
 const MIN_SENTENCE_LENGTH = 24;
+const MIN_GENERATED_SENTENCE_LENGTH = 20;
 const MAX_SENTENCE_LENGTH = 320;
-const MAX_SENTENCES_PER_SOURCE = 2;
+const MAX_SENTENCES_PER_SOURCE = parsePositiveInt(process.env.AI_OVERVIEW_MAX_SENTENCES_PER_SOURCE, 3);
 const MAX_SOURCES = 4;
 const DEDUPE_SIMILARITY_THRESHOLD = 0.78;
 const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
@@ -15,8 +16,9 @@ const EMBEDDING_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.EMBEDDING_SERV
 const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 20000);
 const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 12);
 const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 280);
+const ALIGNMENT_SCORE_THRESHOLD = parsePositiveNumber(process.env.AI_OVERVIEW_ALIGNMENT_THRESHOLD, 0.55);
 const ENABLE_GENERATIVE_OVERVIEW = String(process.env.AI_OVERVIEW_GENERATIVE || 'true').toLowerCase() !== 'false';
-const CANDIDATE_ROW_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_MAX_ROWS, 15);
+const CANDIDATE_ROW_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_MAX_ROWS, 20);
 
 let summarizeCapabilityKnown = false;
 let summarizeCapabilityAvailable = false;
@@ -27,9 +29,22 @@ const STOP_WORDS = new Set([
   'those', 'which', 'into', 'about', 'than', 'then', 'also', 'such', 'their', 'there', 'they',
 ]);
 
+const ANCHOR_GENERIC_TOKENS = new Set([
+  'cause', 'causes', 'reason', 'reasons', 'why', 'effect', 'effects', 'impact', 'overview', 'summary',
+  'explain', 'explanation', 'introduction', 'background', 'history', 'timeline', 'meaning', 'definition',
+  'difference', 'differences', 'compare', 'comparison', 'between', 'who', 'what', 'when', 'where', 'how',
+  'uprising', 'revolution', 'war', 'battle', 'conflict', 'movement', 'protest', 'rebellion',
+  'insurrection', 'riot',
+]);
+
 function parsePositiveInt(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function parsePositiveNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function clamp(value, min, max) {
@@ -102,21 +117,71 @@ function jaccardSimilarity(tokensA, tokensB) {
 }
 
 function keywordOverlapScore(query, sentence) {
-  const queryWords = String(query || '').toLowerCase().split(/\W+/).filter(Boolean);
-  if (!queryWords.length) return 0;
+  const queryTokens = tokenize(query);
+  if (!queryTokens.length) return 0;
 
-  const sentenceWords = new Set(
-    String(sentence || '').toLowerCase().split(/\W+/).filter(Boolean),
-  );
-
+  const sentenceTokens = new Set(tokenize(sentence));
   let overlap = 0;
-  queryWords.forEach((word) => {
-    if (sentenceWords.has(word)) {
-      overlap += 1;
-    }
-  });
 
-  return overlap / queryWords.length;
+  for (const token of queryTokens) {
+    if (sentenceTokens.has(token)) overlap += 1;
+  }
+
+  return overlap / queryTokens.length;
+}
+
+function keywordOverlapScoreWithTitle(query, sentence, title) {
+  return keywordOverlapScore(query, `${sentence || ''} ${title || ''}`);
+}
+
+function computeAnchorTokens(queryText, candidates) {
+  const originalQueryTokens = tokenize(queryText);
+  if (!originalQueryTokens.length || !Array.isArray(candidates) || candidates.length === 0) return [];
+
+  const filteredQueryTokens = originalQueryTokens.filter((token) => !ANCHOR_GENERIC_TOKENS.has(token));
+  const queryTokens = filteredQueryTokens.length ? filteredQueryTokens : originalQueryTokens;
+
+  const counts = new Map(queryTokens.map((token) => [token, 0]));
+
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate.sentenceTokens)) {
+      candidate.sentenceTokens = tokenize(candidate.text);
+    }
+
+    const combined = new Set([
+      ...candidate.sentenceTokens,
+      ...tokenize(candidate?.source?.title),
+    ]);
+
+    for (const token of queryTokens) {
+      if (combined.has(token)) {
+        counts.set(token, (counts.get(token) || 0) + 1);
+      }
+    }
+  }
+
+  const present = queryTokens.filter((token) => (counts.get(token) || 0) > 0);
+  if (!present.length) return [];
+
+  present.sort((a, b) => (counts.get(a) || 0) - (counts.get(b) || 0));
+
+  const anchors = present.slice(0, Math.min(2, present.length));
+
+  // Only enforce anchors if they actually narrow candidates.
+  let matches = 0;
+  for (const candidate of candidates) {
+    const combined = new Set([
+      ...(Array.isArray(candidate.sentenceTokens) ? candidate.sentenceTokens : tokenize(candidate.text)),
+      ...tokenize(candidate?.source?.title),
+    ]);
+
+    if (anchors.some((token) => combined.has(token))) {
+      matches += 1;
+    }
+  }
+
+  if (matches === 0 || matches === candidates.length) return [];
+  return anchors;
 }
 
 function positionScore(index) {
@@ -303,7 +368,7 @@ function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
     .map((candidate, index) => {
       const sentenceEmbedding = embeddings[index + 1];
       const semanticScore = cosineSimilarity(queryEmbedding, sentenceEmbedding);
-      const keywordScore = keywordOverlapScore(queryText, candidate.text);
+      const keywordScore = keywordOverlapScoreWithTitle(queryText, candidate.text, candidate?.source?.title);
       const structureScore = positionScore(index);
       const credibilityScore = sourceCredibilityScore(candidate.source);
 
@@ -379,8 +444,9 @@ function selectClusterRepresentativeSentences(scoredCandidates, minSentences, ma
   return selected.slice(0, targetCount);
 }
 
-function scoreCandidatesFallback(candidates) {
+function scoreCandidatesFallback(queryText, candidates) {
   const maxRowIndex = Math.max(...candidates.map((candidate) => candidate.rowIndex), 0);
+  const safeQueryText = String(queryText || '');
 
   return candidates
     .map((candidate) => {
@@ -389,69 +455,215 @@ function scoreCandidatesFallback(candidates) {
       const titleBoost = candidate.fromTitle ? 0.08 : 0;
       const credibilityScore = sourceCredibilityScore(candidate.source);
       const baseScore = clamp(0.4 + rowScore * 0.5 + positionBoost + titleBoost, 0, 1);
+      const keywordScore = keywordOverlapScoreWithTitle(safeQueryText, candidate.text, candidate?.source?.title);
 
       return {
         ...candidate,
         credibilityScore,
-        score: clamp(0.8 * baseScore + 0.2 * credibilityScore, 0, 1),
+        score: clamp(0.45 * keywordScore + 0.35 * baseScore + 0.2 * credibilityScore, 0, 1),
         sentenceTokens: tokenize(candidate.text),
       };
     })
     .sort(sortByScoreThenPosition);
 }
 
-function pickEvidenceSentences(scoredCandidates, intent, maxEvidence) {
+function cleanNarrativeSummary(summaryText) {
+  let text = String(summaryText || '').trim();
+  if (!text) return '';
+
+  // Remove echoed source metadata lines like: "[1] Title — Author — https://..." or "— #".
+  const lines = text.split(/\r?\n+/).map((line) => line.trim()).filter(Boolean);
+  const filtered = lines.filter((line) => {
+    const looksLikeMeta = /^\[\d+\]\s+.+\s—\s.+\s—\s(https?:\/\/\S+|#)\s*$/i.test(line);
+    return !looksLikeMeta;
+  });
+
+  text = filtered.join(' ');
+  text = text.replace(/\[\d+\]/g, '').replace(/\s+/g, ' ').trim();
+  return text;
+}
+
+function splitGeneratedSummary(summaryText) {
+  return String(summaryText || '')
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length >= MIN_GENERATED_SENTENCE_LENGTH);
+}
+
+function roundConfidence(score) {
+  return Math.round(clamp(score, 0, 1) * 100) / 100;
+}
+
+function attachOverviewMeta(overview, meta) {
+  if (!overview) return null;
+  return {
+    ...overview,
+    meta: meta ? { ...meta } : undefined,
+  };
+}
+
+function logNarrativeStatus(meta, requestId) {
+  if (!meta) return;
+  const prefix = requestId ? `[${requestId}]` : '[summarizer]';
+  const payload = {
+    status: meta.status,
+    reason: meta.reason,
+    summarizer: meta.summarizer,
+    alignment: meta.alignment,
+  };
+
+  if (meta.status === 'aligned') {
+    console.info(`${prefix} narrative summary aligned`, payload);
+  } else {
+    console.warn(`${prefix} narrative summary skipped`, payload);
+  }
+}
+
+async function verifyEvidenceAlignment(generatedSentences, evidenceSentences) {
+  if (!Array.isArray(generatedSentences) || generatedSentences.length === 0) return [];
+  if (!Array.isArray(evidenceSentences) || evidenceSentences.length === 0) return [];
+
+  const evidenceTextItems = evidenceSentences
+    .map((item) => ({
+      evidence: item,
+      text: String(item?.text || '').trim(),
+    }))
+    .filter((item) => item.text);
+
+  if (!evidenceTextItems.length) return [];
+
+  const texts = [
+    ...generatedSentences,
+    ...evidenceTextItems.map((item) => item.text),
+  ];
+
+  const embeddings = await getEmbeddings(texts);
+  if (!embeddings) return null;
+
+  const generatedEmbeddings = embeddings.slice(0, generatedSentences.length);
+  const evidenceEmbeddings = embeddings.slice(generatedSentences.length);
+
+  return generatedSentences.map((sentence, i) => {
+    let bestScore = 0;
+    let bestIndex = -1;
+
+    evidenceEmbeddings.forEach((vector, j) => {
+      const score = cosineSimilarity(generatedEmbeddings[i], vector);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = j;
+      }
+    });
+
+    const bestEvidence = bestIndex >= 0 ? evidenceTextItems[bestIndex].evidence : null;
+
+    return {
+      sentence,
+      confidence: bestScore,
+      evidence: bestEvidence,
+    };
+  });
+}
+
+function pickEvidenceSentences(scoredCandidates, intent, maxEvidence, queryText) {
   const target = Math.max(1, Number(maxEvidence) || 0);
   const prioritized = prioritizeCandidatesForIntent(scoredCandidates, intent);
 
-  const evidence = [];
-  const sourceCounter = new Map();
-  const sourcePool = new Set();
+  const anchorTokens = computeAnchorTokens(queryText, prioritized);
 
-  for (const candidate of prioritized) {
-    if (evidence.length >= target) break;
-
-    const key = sourceKey(candidate.source);
-    const sourceCount = sourceCounter.get(key) || 0;
-    const introducesNewSource = !sourcePool.has(key);
-
-    if (sourceCount >= MAX_SENTENCES_PER_SOURCE) continue;
-    if (introducesNewSource && sourcePool.size >= MAX_SOURCES) continue;
+  function candidateMatchesAnchors(candidate) {
+    if (!anchorTokens.length) return true;
 
     if (!Array.isArray(candidate.sentenceTokens)) {
       candidate.sentenceTokens = tokenize(candidate.text);
     }
 
-    const tooSimilar = evidence.some((picked) => (
-      jaccardSimilarity(candidate.sentenceTokens, picked.sentenceTokens) >= DEDUPE_SIMILARITY_THRESHOLD
-    ));
-    if (tooSimilar) continue;
+    const combined = new Set([
+      ...candidate.sentenceTokens,
+      ...tokenize(candidate?.source?.title),
+    ]);
 
-    evidence.push(candidate);
-    sourceCounter.set(key, sourceCount + 1);
-    sourcePool.add(key);
+    return anchorTokens.some((token) => combined.has(token));
+  }
+
+  function buildEvidence({ allowTitles, enforceAnchors }) {
+    const evidence = [];
+    const sourceCounter = new Map();
+    const sourcePool = new Set();
+
+    for (const candidate of prioritized) {
+      if (evidence.length >= target) break;
+      if (!allowTitles && candidate.fromTitle) continue;
+      if (enforceAnchors && !candidateMatchesAnchors(candidate)) continue;
+
+      const key = sourceKey(candidate.source);
+      const sourceCount = sourceCounter.get(key) || 0;
+      const introducesNewSource = !sourcePool.has(key);
+
+      if (sourceCount >= MAX_SENTENCES_PER_SOURCE) continue;
+      if (introducesNewSource && sourcePool.size >= MAX_SOURCES) continue;
+
+      if (!Array.isArray(candidate.sentenceTokens)) {
+        candidate.sentenceTokens = tokenize(candidate.text);
+      }
+
+      const tooSimilar = evidence.some((picked) => (
+        jaccardSimilarity(candidate.sentenceTokens, picked.sentenceTokens) >= DEDUPE_SIMILARITY_THRESHOLD
+      ));
+      if (tooSimilar) continue;
+
+      evidence.push(candidate);
+      sourceCounter.set(key, sourceCount + 1);
+      sourcePool.add(key);
+    }
+
+    return evidence;
+  }
+
+  // Prefer descriptive evidence (skip titles) and enforce anchors when available.
+  let evidence = buildEvidence({ allowTitles: false, enforceAnchors: true });
+
+  // If anchors are too strict, retry without anchor enforcement.
+  if (!evidence.length) {
+    evidence = buildEvidence({ allowTitles: false, enforceAnchors: false });
+  }
+
+  // If still empty, allow titles as a last resort.
+  if (!evidence.length) {
+    evidence = buildEvidence({ allowTitles: true, enforceAnchors: false });
   }
 
   return evidence;
 }
 
-async function generateNarrativeSummary({ queryText, intent, evidenceSentences }) {
-  if (!ENABLE_GENERATIVE_OVERVIEW) return null;
-  if (!Array.isArray(evidenceSentences) || evidenceSentences.length === 0) return null;
-  if (summarizeCapabilityKnown && !summarizeCapabilityAvailable) return null;
-
-  const { sources, sourceRefByKey } = buildSourcesFromEvidence(evidenceSentences);
-
-  const contextLines = [];
-  for (const source of sources) {
-    contextLines.push(`[${source.ref}] ${source.title} — ${source.author} — ${source.url}`);
+async function generateNarrativeSummary({ queryText, intent, evidenceSentences, statusRef }) {
+  if (!ENABLE_GENERATIVE_OVERVIEW) {
+    if (statusRef) {
+      statusRef.status = 'skipped';
+      statusRef.reason = 'disabled';
+      statusRef.summarizer = 'disabled';
+    }
+    return null;
+  }
+  if (!Array.isArray(evidenceSentences) || evidenceSentences.length === 0) {
+    if (statusRef) {
+      statusRef.status = 'skipped';
+      statusRef.reason = 'no_evidence';
+    }
+    return null;
+  }
+  if (summarizeCapabilityKnown && !summarizeCapabilityAvailable) {
+    if (statusRef) {
+      statusRef.status = 'skipped';
+      statusRef.reason = 'summarizer_unavailable';
+      statusRef.summarizer = 'down';
+    }
+    return null;
   }
 
-  for (const item of evidenceSentences) {
-    const key = sourceKey(item.source);
-    const ref = sourceRefByKey.get(key);
-    contextLines.push(`[${ref || 0}] ${item.text}`);
-  }
+  const evidenceTexts = evidenceSentences
+    .filter((item) => item && typeof item.text === 'string' && item.text.trim())
+    .map((item) => item.text.trim());
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), SUMMARIZE_SERVICE_TIMEOUT_MS);
@@ -463,7 +675,7 @@ async function generateNarrativeSummary({ queryText, intent, evidenceSentences }
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        texts: contextLines,
+        texts: evidenceTexts,
         query: queryText,
         intent,
         max_new_tokens: RAG_MAX_NEW_TOKENS,
@@ -480,12 +692,26 @@ async function generateNarrativeSummary({ queryText, intent, evidenceSentences }
     }
 
     const data = await response.json();
-    const summary = String(data?.summary || '').trim();
+    const summary = cleanNarrativeSummary(data?.summary);
 
     summarizeCapabilityKnown = true;
     summarizeCapabilityAvailable = true;
+
+    if (statusRef) {
+      statusRef.summarizer = 'up';
+      statusRef.status = summary ? 'generated' : 'skipped';
+      statusRef.reason = summary ? 'ok' : 'empty_summary';
+    }
+
     return summary || null;
   } catch (error) {
+    if (statusRef) {
+      statusRef.status = 'failed';
+      statusRef.reason = error?.name === 'AbortError'
+        ? 'summarizer_timeout'
+        : `summarizer_error:${error?.message || 'unknown'}`;
+      statusRef.summarizer = 'down';
+    }
     console.warn('[summarizer] narrative summarization failed, falling back to extractive overview', {
       message: error?.message,
       serviceUrl: EMBEDDING_SERVICE_URL,
@@ -494,6 +720,42 @@ async function generateNarrativeSummary({ queryText, intent, evidenceSentences }
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+async function alignNarrativeSummaryToEvidence(narrativeSummary, evidenceSentences, statusRef) {
+  const generatedSentences = splitGeneratedSummary(narrativeSummary);
+  if (!generatedSentences.length) {
+    if (statusRef) {
+      statusRef.status = 'skipped';
+      statusRef.reason = 'empty_generated_sentences';
+      statusRef.alignment = 'skipped';
+    }
+    return null;
+  }
+
+  const alignmentResults = await verifyEvidenceAlignment(generatedSentences, evidenceSentences);
+  if (!alignmentResults) {
+    if (statusRef) {
+      statusRef.status = 'skipped';
+      statusRef.reason = 'alignment_embeddings_unavailable';
+      statusRef.alignment = 'skipped';
+    }
+    return null;
+  }
+
+  const alignedSentences = alignmentResults.filter((item) => (
+    item
+    && item.evidence
+    && item.confidence >= ALIGNMENT_SCORE_THRESHOLD
+  ));
+
+  if (statusRef) {
+    statusRef.status = alignedSentences.length ? 'aligned' : 'skipped';
+    statusRef.reason = alignedSentences.length ? 'ok' : 'alignment_filtered';
+    statusRef.alignment = alignedSentences.length ? 'passed' : 'filtered';
+  }
+
+  return alignedSentences.length ? alignedSentences : null;
 }
 
 function selectBestSentences(scoredCandidates, minSentences, maxSentences, intent = 'general') {
@@ -597,13 +859,43 @@ function buildOverview(selectedSentences) {
   };
 }
 
-function buildGenerativeOverview(narrativeSummary, evidenceSentences) {
+function buildAlignedGenerativeOverview(alignedResults, evidenceSentences) {
+  if (!Array.isArray(alignedResults) || alignedResults.length === 0) return null;
+
   const evidenceOverview = buildOverview(evidenceSentences);
+  if (!evidenceOverview) return null;
+
+  const sourceRefByKey = new Map(
+    evidenceOverview.sources.map((source) => [sourceKey(source), source.ref]),
+  );
+
+  const alignedSentenceDetails = alignedResults
+    .map((item) => {
+      const source = item?.evidence?.source;
+      const key = sourceKey(source);
+      const sourceRef = sourceRefByKey.get(key) || null;
+
+      return {
+        text: item?.sentence,
+        confidence: roundConfidence(item?.confidence || 0),
+        sourceRef,
+        citation: sourceRef ? `[${sourceRef}]` : '',
+      };
+    })
+    .filter((item) => item.text);
+
+  if (!alignedSentenceDetails.length) return null;
+
+  const snippet = alignedSentenceDetails.map((item) => item.text).join(' ');
+  const snippetWithCitations = alignedSentenceDetails
+    .map((item) => (item.citation ? `${item.text} ${item.citation}` : item.text))
+    .join(' ');
 
   return {
     ...evidenceOverview,
-    snippet: narrativeSummary,
-    snippetWithCitations: narrativeSummary,
+    snippet: snippetWithCitations,
+    snippetWithCitations,
+    alignedSentenceDetails,
   };
 }
 
@@ -631,6 +923,10 @@ function detectIntent(query) {
 
   if (q.startsWith('what is') || q.startsWith('define')) {
     return 'definition';
+  }
+
+  if (q.startsWith('why') || q.includes('cause ') || q.includes('causes ')) {
+    return 'causal';
   }
 
   if (q.includes('timeline') || q.includes('history of')) {
@@ -688,6 +984,13 @@ export async function generateOverview(query, rows, options = {}) {
   const minSentences = Math.min(requestedMin, requestedMax);
   const maxSentences = Math.max(requestedMin, requestedMax);
   const intent = detectIntent(queryText);
+  const requestId = options.requestId;
+  const narrativeMeta = {
+    status: 'skipped',
+    reason: 'not_attempted',
+    summarizer: 'unknown',
+    alignment: 'skipped',
+  };
 
   if (!queryText || !safeRows.length) {
     return null;
@@ -701,24 +1004,60 @@ export async function generateOverview(query, rows, options = {}) {
   if (embeddings) {
     const scoredCandidates = scoreCandidatesWithEmbeddings(queryText, candidates, embeddings);
 
-    const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT);
-    const narrativeSummary = await generateNarrativeSummary({ queryText, intent, evidenceSentences });
+    const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT, queryText);
+    const narrativeSummary = await generateNarrativeSummary({
+      queryText,
+      intent,
+      evidenceSentences,
+      statusRef: narrativeMeta,
+    });
     if (narrativeSummary) {
-      return buildGenerativeOverview(narrativeSummary, evidenceSentences);
+      const alignedResults = await alignNarrativeSummaryToEvidence(
+        narrativeSummary,
+        evidenceSentences,
+        narrativeMeta,
+      );
+      const alignedOverview = alignedResults
+        ? buildAlignedGenerativeOverview(alignedResults, evidenceSentences)
+        : null;
+
+      if (alignedOverview) {
+        logNarrativeStatus(narrativeMeta, requestId);
+        return attachOverviewMeta(alignedOverview, narrativeMeta);
+      }
     }
 
     const selected = selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences, intent);
-    return buildOverview(selected);
+    logNarrativeStatus(narrativeMeta, requestId);
+    return attachOverviewMeta(buildOverview(selected), narrativeMeta);
   }
 
-  const scoredCandidates = scoreCandidatesFallback(candidates);
+  const scoredCandidates = scoreCandidatesFallback(queryText, candidates);
 
-  const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT);
-  const narrativeSummary = await generateNarrativeSummary({ queryText, intent, evidenceSentences });
+  const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT, queryText);
+  const narrativeSummary = await generateNarrativeSummary({
+    queryText,
+    intent,
+    evidenceSentences,
+    statusRef: narrativeMeta,
+  });
   if (narrativeSummary) {
-    return buildGenerativeOverview(narrativeSummary, evidenceSentences);
+    const alignedResults = await alignNarrativeSummaryToEvidence(
+      narrativeSummary,
+      evidenceSentences,
+      narrativeMeta,
+    );
+    const alignedOverview = alignedResults
+      ? buildAlignedGenerativeOverview(alignedResults, evidenceSentences)
+      : null;
+
+    if (alignedOverview) {
+      logNarrativeStatus(narrativeMeta, requestId);
+      return attachOverviewMeta(alignedOverview, narrativeMeta);
+    }
   }
 
   const selected = selectBestSentences(scoredCandidates, minSentences, maxSentences, intent);
-  return buildOverview(selected);
+  logNarrativeStatus(narrativeMeta, requestId);
+  return attachOverviewMeta(buildOverview(selected), narrativeMeta);
 }

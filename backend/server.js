@@ -250,6 +250,7 @@ app.post('/api/search', async (req, res) => {
     const aiSummary = await generateOverview(query, normalizedRows, {
       minSentences: 2,
       maxSentences: 4,
+      requestId,
     });
 
     res.json({

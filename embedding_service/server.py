@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import uvicorn
@@ -9,7 +10,7 @@ app = FastAPI()
 
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-SUMMARY_MODEL_NAME = "google/flan-t5-base"
+SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "google/flan-t5-base")
 summary_tokenizer = AutoTokenizer.from_pretrained(SUMMARY_MODEL_NAME)
 summary_model = AutoModelForSeq2SeqLM.from_pretrained(SUMMARY_MODEL_NAME)
 summary_model.eval()
@@ -36,6 +37,11 @@ def build_prompt(context: str, query: str | None, intent: str | None) -> str:
     if safe_intent == "definition":
         intent_guidance = (
             "Start with a one-sentence definition, then explain key aspects and significance. "
+        )
+    elif safe_intent == "causal":
+        intent_guidance = (
+            "Explain causes by grouping into 2–3 categories (for example: economic, political, social/ideological) if supported by the sources. "
+            "Mention both underlying factors and immediate triggers when possible. "
         )
     elif safe_intent == "timeline":
         intent_guidance = (

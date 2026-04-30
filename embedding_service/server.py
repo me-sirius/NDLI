@@ -58,9 +58,12 @@ def build_prompt(context: str, query: str | None, intent: str | None) -> str:
 
     header = (
         "You are an academic assistant. Write a clear, well-structured overview grounded ONLY in the provided sources. "
-        "Write 5–7 sentences (about 120–180 words) as a single paragraph. "
+        "Write 6–9 sentences (about 160–240 words) as a single paragraph. "
         + intent_guidance
-        + "Do not add facts not present in the sources. Do not use bullet points. Do not include citations like [1]."
+        + "Do not add facts not present in the sources. Do not use bullet points. Do not include citations like [1]. "
+        + "Return only the final summary paragraph; do not echo labels like 'Query', 'Intent', or 'Sources (evidence)'. "
+        + "When possible, cover: definition, core mechanism or steps, key inputs/outputs, and why it matters. "
+        + "If a component is not supported by the sources, omit it."
     )
 
     if safe_query:

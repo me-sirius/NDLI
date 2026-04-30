@@ -6,7 +6,7 @@ const MIN_SENTENCE_WORDS = 6;
 const MIN_SENTENCE_LENGTH = 24;
 const MIN_GENERATED_SENTENCE_LENGTH = 20;
 const MAX_SENTENCE_LENGTH = 320;
-const MAX_SENTENCES_PER_SOURCE = parsePositiveInt(process.env.AI_OVERVIEW_MAX_SENTENCES_PER_SOURCE, 3);
+const MAX_SENTENCES_PER_SOURCE = parsePositiveInt(process.env.AI_OVERVIEW_MAX_SENTENCES_PER_SOURCE, 4);
 const MAX_SOURCES = 4;
 const DEDUPE_SIMILARITY_THRESHOLD = 0.78;
 const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
@@ -14,7 +14,7 @@ const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 const EMBEDDING_SERVICE_URL = (process.env.EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 const EMBEDDING_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.EMBEDDING_SERVICE_TIMEOUT_MS, 4500);
 const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 20000);
-const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 12);
+const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 16);
 const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 280);
 const ALIGNMENT_SCORE_THRESHOLD = parsePositiveNumber(process.env.AI_OVERVIEW_ALIGNMENT_THRESHOLD, 0.55);
 const ENABLE_GENERATIVE_OVERVIEW = String(process.env.AI_OVERVIEW_GENERATIVE || 'true').toLowerCase() !== 'false';
@@ -28,6 +28,19 @@ const STOP_WORDS = new Set([
   'its', 'of', 'on', 'or', 'that', 'the', 'to', 'was', 'were', 'will', 'with', 'this', 'these',
   'those', 'which', 'into', 'about', 'than', 'then', 'also', 'such', 'their', 'there', 'they',
 ]);
+
+const META_PHRASES = [
+  'video lecture', 'lecture', 'class', 'grade', 'chapter', 'worksheet', 'activity', 'lesson',
+  'unit', 'module', 'objective', 'practice', 'assignment', 'quiz', 'mcq', 'question paper',
+  'solutions', 'answer key', 'ppt', 'slides', 'presentation', 'notes', 'handout',
+  'course', 'curriculum', 'syllabus', 'experiment manual', 'lab manual',
+];
+
+const CONTENT_HINTS = [
+  'process', 'convert', 'converts', 'conversion', 'occurs', 'produces', 'results', 'uses',
+  'requires', 'involves', 'consists', 'stages', 'steps', 'reaction', 'equation', 'formula',
+  'inputs', 'outputs', 'mechanism', 'function', 'role', 'because', 'therefore',
+];
 
 const ANCHOR_GENERIC_TOKENS = new Set([
   'cause', 'causes', 'reason', 'reasons', 'why', 'effect', 'effects', 'impact', 'overview', 'summary',
@@ -63,6 +76,30 @@ function tokenize(text) {
   const normalized = normalizeText(text);
   const matches = normalized.match(WORD_REGEX) || [];
   return matches.filter((token) => token.length > 1 && !STOP_WORDS.has(token));
+}
+
+function countPhraseHits(text, phrases) {
+  const normalized = normalizeText(text);
+  return phrases.reduce((count, phrase) => (
+    normalized.includes(phrase) ? count + 1 : count
+  ), 0);
+}
+
+function isMetaSentence(text) {
+  const normalized = normalizeText(text);
+  const metaHits = countPhraseHits(normalized, META_PHRASES)
+    + (/(?:^|\s)(class|grade)\s*\d+/.test(normalized) ? 1 : 0);
+  const contentHits = countPhraseHits(normalized, CONTENT_HINTS);
+
+  if (metaHits >= 2) return true;
+  if (metaHits >= 1 && contentHits === 0 && normalized.length < 140) return true;
+  return false;
+}
+
+function isResourceQuery(queryText) {
+  const normalized = normalizeText(queryText);
+  return META_PHRASES.some((phrase) => normalized.includes(phrase))
+    || /(?:^|\s)(class|grade)\s*\d+/.test(normalized);
 }
 
 function splitSentences(text) {
@@ -371,6 +408,7 @@ function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
       const keywordScore = keywordOverlapScoreWithTitle(queryText, candidate.text, candidate?.source?.title);
       const structureScore = positionScore(index);
       const credibilityScore = sourceCredibilityScore(candidate.source);
+      const metaPenalty = isMetaSentence(candidate.text) ? 0.2 : 0;
 
       return {
         ...candidate,
@@ -380,7 +418,8 @@ function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
           0.5 * semanticScore
           + 0.2 * keywordScore
           + 0.1 * structureScore
-          + 0.2 * credibilityScore,
+          + 0.2 * credibilityScore
+          - metaPenalty,
           0,
           1,
         ),
@@ -456,11 +495,12 @@ function scoreCandidatesFallback(queryText, candidates) {
       const credibilityScore = sourceCredibilityScore(candidate.source);
       const baseScore = clamp(0.4 + rowScore * 0.5 + positionBoost + titleBoost, 0, 1);
       const keywordScore = keywordOverlapScoreWithTitle(safeQueryText, candidate.text, candidate?.source?.title);
+      const metaPenalty = isMetaSentence(candidate.text) ? 0.2 : 0;
 
       return {
         ...candidate,
         credibilityScore,
-        score: clamp(0.45 * keywordScore + 0.35 * baseScore + 0.2 * credibilityScore, 0, 1),
+        score: clamp(0.45 * keywordScore + 0.35 * baseScore + 0.2 * credibilityScore - metaPenalty, 0, 1),
         sentenceTokens: tokenize(candidate.text),
       };
     })
@@ -480,6 +520,15 @@ function cleanNarrativeSummary(summaryText) {
 
   text = filtered.join(' ');
   text = text.replace(/\[\d+\]/g, '').replace(/\s+/g, ' ').trim();
+
+  // Strip prompt-echo artifacts like "Query:", "Intent:", and "Sources (evidence):".
+  text = text
+    .replace(/\bquery\s*:\s*[^.?!]*?(?=intent\s*:|sources?\s*\(evidence\)\s*:|$)/gi, '')
+    .replace(/\bintent\s*:\s*[^.?!]*?(?=sources?\s*\(evidence\)\s*:|$)/gi, '')
+    .replace(/\bsources?\s*\(evidence\)\s*:\s*/gi, '')
+    .replace(/\bsources?\s*:\s*/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   return text;
 }
 
@@ -568,6 +617,7 @@ async function verifyEvidenceAlignment(generatedSentences, evidenceSentences) {
 function pickEvidenceSentences(scoredCandidates, intent, maxEvidence, queryText) {
   const target = Math.max(1, Number(maxEvidence) || 0);
   const prioritized = prioritizeCandidatesForIntent(scoredCandidates, intent);
+  const resourceQuery = isResourceQuery(queryText);
 
   const anchorTokens = computeAnchorTokens(queryText, prioritized);
 
@@ -586,7 +636,7 @@ function pickEvidenceSentences(scoredCandidates, intent, maxEvidence, queryText)
     return anchorTokens.some((token) => combined.has(token));
   }
 
-  function buildEvidence({ allowTitles, enforceAnchors }) {
+  function buildEvidence({ allowTitles, enforceAnchors, allowMeta }) {
     const evidence = [];
     const sourceCounter = new Map();
     const sourcePool = new Set();
@@ -595,6 +645,7 @@ function pickEvidenceSentences(scoredCandidates, intent, maxEvidence, queryText)
       if (evidence.length >= target) break;
       if (!allowTitles && candidate.fromTitle) continue;
       if (enforceAnchors && !candidateMatchesAnchors(candidate)) continue;
+      if (!allowMeta && isMetaSentence(candidate.text)) continue;
 
       const key = sourceKey(candidate.source);
       const sourceCount = sourceCounter.get(key) || 0;
@@ -621,16 +672,21 @@ function pickEvidenceSentences(scoredCandidates, intent, maxEvidence, queryText)
   }
 
   // Prefer descriptive evidence (skip titles) and enforce anchors when available.
-  let evidence = buildEvidence({ allowTitles: false, enforceAnchors: true });
+  let evidence = buildEvidence({ allowTitles: false, enforceAnchors: true, allowMeta: resourceQuery });
 
   // If anchors are too strict, retry without anchor enforcement.
-  if (!evidence.length) {
-    evidence = buildEvidence({ allowTitles: false, enforceAnchors: false });
+  if (evidence.length < Math.min(3, target)) {
+    evidence = buildEvidence({ allowTitles: false, enforceAnchors: false, allowMeta: resourceQuery });
+  }
+
+  // If still too sparse, allow meta sentences.
+  if (evidence.length < Math.min(2, target) && !resourceQuery) {
+    evidence = buildEvidence({ allowTitles: false, enforceAnchors: false, allowMeta: true });
   }
 
   // If still empty, allow titles as a last resort.
   if (!evidence.length) {
-    evidence = buildEvidence({ allowTitles: true, enforceAnchors: false });
+    evidence = buildEvidence({ allowTitles: true, enforceAnchors: false, allowMeta: true });
   }
 
   return evidence;

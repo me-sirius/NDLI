@@ -248,8 +248,8 @@ app.post('/api/search', async (req, res) => {
     const rows = Array.isArray(raw?.rows) ? raw.rows : [];
     const normalizedRows = rows.map(normalizeRow).filter((r) => r.title || r.desc);
     const aiSummary = await generateOverview(query, normalizedRows, {
-      minSentences: 2,
-      maxSentences: 4,
+      minSentences: 4,
+      maxSentences: 8,
       requestId,
     });
 

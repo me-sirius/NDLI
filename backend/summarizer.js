@@ -6,16 +6,16 @@ const MIN_SENTENCE_WORDS = 6;
 const MIN_SENTENCE_LENGTH = 24;
 const MIN_GENERATED_SENTENCE_LENGTH = 20;
 const MAX_SENTENCE_LENGTH = 320;
-const MAX_SENTENCES_PER_SOURCE = parsePositiveInt(process.env.AI_OVERVIEW_MAX_SENTENCES_PER_SOURCE, 4);
-const MAX_SOURCES = 4;
+const MAX_SENTENCES_PER_SOURCE = parsePositiveInt(process.env.AI_OVERVIEW_MAX_SENTENCES_PER_SOURCE, 6);
+const MAX_SOURCES = 6;
 const DEDUPE_SIMILARITY_THRESHOLD = 0.78;
 const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 
 const EMBEDDING_SERVICE_URL = (process.env.EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 const EMBEDDING_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.EMBEDDING_SERVICE_TIMEOUT_MS, 4500);
 const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 45000);
-const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 16);
-const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 400);
+const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 24);
+const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 800);
 const ALIGNMENT_SCORE_THRESHOLD = parsePositiveNumber(process.env.AI_OVERVIEW_ALIGNMENT_THRESHOLD, 0.55);
 const ENABLE_GENERATIVE_OVERVIEW = String(process.env.AI_OVERVIEW_GENERATIVE || 'true').toLowerCase() !== 'false';
 const CANDIDATE_ROW_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_MAX_ROWS, 20);
@@ -91,8 +91,11 @@ function isMetaSentence(text) {
     + (/(?:^|\s)(class|grade)\s*\d+/.test(normalized) ? 1 : 0);
   const contentHits = countPhraseHits(normalized, CONTENT_HINTS);
 
-  if (metaHits >= 2) return true;
-  if (metaHits >= 1 && contentHits === 0 && normalized.length < 140) return true;
+  // More aggressive meta detection
+  if (metaHits >= 1) return true;
+  if (metaHits >= 1 && contentHits === 0) return true;
+  // Filter out very short sentences that are likely meta
+  if (normalized.length < 100 && contentHits === 0) return true;
   return false;
 }
 
@@ -408,7 +411,7 @@ function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
       const keywordScore = keywordOverlapScoreWithTitle(queryText, candidate.text, candidate?.source?.title);
       const structureScore = positionScore(index);
       const credibilityScore = sourceCredibilityScore(candidate.source);
-      const metaPenalty = isMetaSentence(candidate.text) ? 0.2 : 0;
+      const metaPenalty = isMetaSentence(candidate.text) ? 0.5 : 0;
 
       return {
         ...candidate,
@@ -495,7 +498,7 @@ function scoreCandidatesFallback(queryText, candidates) {
       const credibilityScore = sourceCredibilityScore(candidate.source);
       const baseScore = clamp(0.4 + rowScore * 0.5 + positionBoost + titleBoost, 0, 1);
       const keywordScore = keywordOverlapScoreWithTitle(safeQueryText, candidate.text, candidate?.source?.title);
-      const metaPenalty = isMetaSentence(candidate.text) ? 0.2 : 0;
+      const metaPenalty = isMetaSentence(candidate.text) ? 0.5 : 0;
 
       return {
         ...candidate,
@@ -749,6 +752,7 @@ async function generateNarrativeSummary({ queryText, intent, evidenceSentences, 
         texts: evidenceTexts,
         query: queryText,
         intent,
+        style: 'google',
         max_new_tokens: RAG_MAX_NEW_TOKENS,
       }),
       signal: controller.signal,

@@ -195,6 +195,31 @@ def extractive_highlights(texts: list[str], query: str | None = None, top_k: int
     return results
 
 
+def build_extractive_summary(query: str | None, highlights: list[list[dict]], max_sentences: int = 3) -> str:
+    # Prefer the strongest non-duplicate sentences from the source highlights.
+    candidates: list[tuple[float, str]] = []
+    seen: set[str] = set()
+
+    for source_items in highlights:
+        for item in source_items:
+            sentence = str(item.get("text", "")).strip()
+            if not sentence:
+                continue
+            normalized = sentence.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            candidates.append((float(item.get("score", 0.0)), sentence))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    chosen = [sentence for _, sentence in candidates[:max_sentences]]
+
+    if not chosen:
+        return "Not enough information in the sources to generate a summary."
+
+    return " ".join(chosen)
+
+
 def generate_summary(context: str, query: str | None = None, intent: str | None = None, style: str | None = None, max_new_tokens: int = 800) -> str:
     prompt = build_prompt(context=context, query=query, intent=intent, style=style)
     summary = _generate_once(prompt, max_new_tokens=max_new_tokens, length_penalty=1.15)
@@ -221,17 +246,21 @@ def embed(req: EmbeddingRequest):
 @app.post("/summarize")
 def summarize(req: SummarizeRequest):
     combined_context = "\n".join([str(t) for t in (req.texts or []) if str(t).strip()])
-    # Generate abstractive summary
-    summary = generate_summary(
-        combined_context,
-        query=req.query,
-        intent=req.intent,
-        style=req.style,
-        max_new_tokens=req.max_new_tokens or 800,
-    )
-
-    # Compute extractive highlights per source to show supporting evidence
     highlights = extractive_highlights(req.texts or [], req.query, top_k=2)
+
+    use_extractive_summary = bool(req.style and req.style.lower() in ("google", "snippet", "natural", "conversational"))
+
+    # Prefer an extractive summary for search-style results so we surface actual source content.
+    if use_extractive_summary:
+        summary = build_extractive_summary(req.query, highlights, max_sentences=4)
+    else:
+        summary = generate_summary(
+            combined_context,
+            query=req.query,
+            intent=req.intent,
+            style=req.style,
+            max_new_tokens=req.max_new_tokens or 800,
+        )
 
     # Build a short search-style snippet: pick highest-scoring highlighted sentence across sources
     top_sentence = None

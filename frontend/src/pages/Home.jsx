@@ -66,6 +66,31 @@ function formatTimestamp(timestamp) {
     });
 }
 
+function shortSha(sha) {
+    if (!sha) return '';
+    return String(sha).slice(0, 7);
+}
+
+function buildLiveVersionLabel(meta) {
+    // If a stable release version is provided at build-time, use it
+    const releaseVersion = import.meta.env.VITE_APP_VERSION;
+    if (releaseVersion) return releaseVersion;
+
+    // Prefer backend sha if available, else embedding, else dev timestamp/tick
+    const backend = meta?.backendSha ? `B:${shortSha(meta.backendSha)}` : null;
+    const embedding = meta?.embeddingSha ? `E:${shortSha(meta.embeddingSha)}` : null;
+    const timeLabel = new Date(meta?.timestamp || Date.now()).toLocaleTimeString([], {
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+
+    const parts = [];
+    if (backend) parts.push(backend);
+    if (embedding) parts.push(embedding);
+    parts.push(`dev ${timeLabel} #${meta?.tick || 0}`);
+
+    return parts.join(' ');
+}
+
 function backendIssueHint(errorCode) {
     switch (errorCode) {
         case 'CORS_BLOCKED':
@@ -217,7 +242,69 @@ export default function Home() {
     const [activeResultType, setActiveResultType] = useState('all');
     const [apiRequestState, setApiRequestState] = useState(null);
     const [alwaysShowNarrative, setAlwaysShowNarrative] = useState(false);
+    const [liveVersionMeta, setLiveVersionMeta] = useState(() => ({
+        timestamp: Date.now(),
+        tick: 1,
+        backendSha: null,
+        embeddingSha: null,
+    }));
+    const [copied, setCopied] = useState(false);
     const inputRef = useRef(null);
+
+    useEffect(() => {
+        const handleVersionBump = (event) => {
+            const eventTimestamp = event?.detail?.at;
+            const nextTimestamp = Number.isFinite(eventTimestamp) ? eventTimestamp : Date.now();
+
+            setLiveVersionMeta((prev) => ({
+                ...prev,
+                timestamp: nextTimestamp,
+                tick: prev.tick + 1,
+            }));
+        };
+
+        window.addEventListener('ndli:frontend-version-bump', handleVersionBump);
+        return () => {
+            window.removeEventListener('ndli:frontend-version-bump', handleVersionBump);
+        };
+    }, []);
+
+    // Poll backend /version to pick up backend and embedding service updates
+    useEffect(() => {
+        let mounted = true;
+        let lastBackend = null;
+        let lastEmbedding = null;
+
+        async function fetchVersion() {
+            try {
+                const r = await fetch('/version');
+                if (!r.ok) return;
+                const j = await r.json();
+                const backendSha = j?.backend?.commitSha || null;
+                const embeddingSha = j?.embedding?.commitSha || null;
+
+                if (!mounted) return;
+
+                if (backendSha !== lastBackend || embeddingSha !== lastEmbedding) {
+                    lastBackend = backendSha;
+                    lastEmbedding = embeddingSha;
+                    setLiveVersionMeta((prev) => ({
+                        ...prev,
+                        timestamp: Date.now(),
+                        tick: prev.tick + 1,
+                        backendSha,
+                        embeddingSha,
+                    }));
+                }
+            } catch (e) {
+                // ignore
+            }
+        }
+
+        fetchVersion();
+        const id = setInterval(fetchVersion, 4000);
+        return () => { mounted = false; clearInterval(id); };
+    }, []);
 
     // Debounced NDLI search
     useEffect(() => {
@@ -440,6 +527,13 @@ export default function Home() {
                         ? `${activeDomainLabel} selected. Start typing to search.`
                         : 'Choose a domain to enable search.';
     const searchDescriptionIds = error ? `${SEARCH_STATUS_ID} ${SEARCH_ERROR_ID}` : SEARCH_STATUS_ID;
+    const liveVersionLabel = buildLiveVersionLabel(liveVersionMeta);
+    const fullVersionText = (() => {
+        const backend = liveVersionMeta.backendSha ? `backend:${liveVersionMeta.backendSha}` : '';
+        const embedding = liveVersionMeta.embeddingSha ? `embedding:${liveVersionMeta.embeddingSha}` : '';
+        const frontend = import.meta.env.VITE_APP_VERSION || `dev:${new Date(liveVersionMeta.timestamp).toISOString()}#${liveVersionMeta.tick}`;
+        return [backend, embedding, frontend].filter(Boolean).join(' | ');
+    })();
 
     return (
         <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#eaf2ff_0%,_#f8fafc_42%,_#ffffff_100%)] text-slate-800">
@@ -455,11 +549,30 @@ export default function Home() {
                             <p className="text-[11px] text-slate-500 font-medium -mt-0.5">National Digital Library of India</p>
                         </div>
                     </div>
-                    {activeDomainLabel && (
-                        <span className="text-xs font-semibold text-[#0b57d0] bg-blue-50 px-3 py-1.5 rounded-full border border-blue-100 animate-fade-in">
-                            {activeDomainLabel}
-                        </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                        <button
+                            type="button"
+                            onClick={async () => {
+                                try {
+                                    await navigator.clipboard.writeText(fullVersionText);
+                                    setCopied(true);
+                                    setTimeout(() => setCopied(false), 1500);
+                                } catch (e) {
+                                    // ignore
+                                }
+                            }}
+                            title="Click to copy version info"
+                            className="text-[10px] font-bold text-slate-600 bg-slate-100 px-2.5 py-1 rounded-full border border-slate-200 flex items-center gap-2 cursor-pointer"
+                        >
+                            <span>Version: {liveVersionLabel}</span>
+                            {copied && (<span className="text-[10px] font-semibold text-emerald-700">Copied</span>)}
+                        </button>
+                        {activeDomainLabel && (
+                            <span className="text-xs font-semibold text-[#0b57d0] bg-blue-50 px-3 py-1.5 rounded-full border border-blue-100 animate-fade-in">
+                                {activeDomainLabel}
+                            </span>
+                        )}
+                    </div>
                 </div>
             </header>
 

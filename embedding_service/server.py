@@ -234,6 +234,24 @@ def health():
     return {"status": "ok", "service": "embedding_service"}
 
 
+@app.get("/version")
+def version():
+    """Return a small version object. Prefer environment variable EMBEDDING_SERVICE_VERSION, fallback to git if available."""
+    import subprocess
+    commit = os.getenv('EMBEDDING_SERVICE_VERSION')
+    if not commit:
+        try:
+            commit = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            commit = 'unknown'
+
+    build_time = os.getenv('EMBEDDING_SERVICE_BUILD_TIME') or ''
+    return {
+        'service': 'embedding_service',
+        'commitSha': commit,
+        'buildTime': build_time,
+    }
+
 @app.post("/embed")
 def embed(req: EmbeddingRequest):
     embeddings = model.encode(req.texts).tolist()

@@ -277,7 +277,10 @@ export default function Home() {
 
         async function fetchVersion() {
             try {
-                const r = await fetch('/version');
+                const base = BACKEND_API_INFO?.baseUrl || '';
+                if (!base) return; // no backend configured
+                const versionUrl = `${base.replace(/\/+$/, '')}/version`;
+                const r = await fetch(versionUrl, { cache: 'no-store' });
                 if (!r.ok) return;
                 const j = await r.json();
                 const backendSha = j?.backend?.commitSha || null;

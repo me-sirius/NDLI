@@ -465,6 +465,44 @@ async function getEmbeddings(texts) {
   }
 }
 
+async function rerankCandidates(queryText, candidates) {
+  if (!candidates || candidates.length === 0) return null;
+
+  const texts = candidates.map((c) => c.text);
+  const controller = new AbortController();
+  // Reranking is heavy, so we give it double the normal timeout
+  const timeoutId = setTimeout(() => controller.abort(), EMBEDDING_SERVICE_TIMEOUT_MS * 2);
+
+  try {
+    const response = await fetch(`${EMBEDDING_SERVICE_URL}/rerank`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query: queryText,
+        texts: texts,
+        top_k: candidates.length // We want ALL candidates scored!
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Reranker failed with status ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data?.results || null;
+  } catch (error) {
+    console.warn('[summarizer] Reranking lookup failed, falling back to old embeddings', {
+      message: error?.message,
+    });
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function scoreCandidatesWithEmbeddings(queryText, candidates, embeddings) {
   const queryEmbedding = embeddings[0];
 
@@ -1140,41 +1178,56 @@ export async function generateOverview(query, rows, options = {}) {
   const candidates = buildCandidates(safeRows);
   if (!candidates.length) return null;
 
-  const texts = [queryText, ...candidates.map((candidate) => candidate.text)];
-  const embeddings = await getEmbeddings(texts);
-  if (embeddings) {
-    const scoredCandidates = scoreCandidatesWithEmbeddings(queryText, candidates, embeddings);
+  let scoredCandidates = [];
 
-    const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT, queryText);
-    const narrativeSummary = await generateNarrativeSummary({
-      queryText,
-      intent,
-      evidenceSentences,
-      statusRef: narrativeMeta,
+  // --- 🌟 NEW: THE RERANKER PIPELINE 🌟 ---
+  // We politely ask our Python service to score all candidates
+  const rerankedResults = await rerankCandidates(queryText, candidates);
+
+  if (rerankedResults && rerankedResults.length > 0) {
+    // 1. Create a quick lookup map for the scores
+    const scoreMap = new Map();
+    rerankedResults.forEach((r) => scoreMap.set(r.text, r.score));
+
+    // 2. Attach the scores to our candidates
+    scoredCandidates = candidates.map((candidate) => {
+      // The python reranker returns a raw "logit" score (can be negative or positive).
+      const rawScore = scoreMap.get(candidate.text) || -10; 
+      
+      // We convert that math into a friendly 0 to 1 percentage using a Sigmoid function
+      const normalizedScore = 1 / (1 + Math.exp(-rawScore));
+
+      return {
+        ...candidate,
+        score: normalizedScore,
+        credibilityScore: sourceCredibilityScore(candidate.source),
+        sentenceTokens: tokenize(candidate.text)
+      };
+    }).sort((a, b) => {
+      // Sort highest score first, fallback to credibility/position on ties
+      if (b.score !== a.score) return b.score - a.score;
+      const credibilityA = Number.isFinite(a?.credibilityScore) ? a.credibilityScore : 0;
+      const credibilityB = Number.isFinite(b?.credibilityScore) ? b.credibilityScore : 0;
+      if (credibilityB !== credibilityA) return credibilityB - credibilityA;
+      if (a.rowIndex !== b.rowIndex) return a.rowIndex - b.rowIndex;
+      return a.sentenceIndex - b.sentenceIndex;
     });
-    if (narrativeSummary) {
-      const alignedResults = await alignNarrativeSummaryToEvidence(
-        narrativeSummary,
-        evidenceSentences,
-        narrativeMeta,
-      );
-      const alignedOverview = alignedResults
-        ? buildAlignedGenerativeOverview(alignedResults, evidenceSentences)
-        : null;
 
-      if (alignedOverview) {
-        logNarrativeStatus(narrativeMeta, requestId);
-        return attachOverviewMeta(alignedOverview, narrativeMeta);
-      }
+  } else {
+    // --- 🚨 OLD PIPELINE (FALLBACK) 🚨 ---
+    // If the reranker is down or times out, we smoothly fall back to the original method!
+    const texts = [queryText, ...candidates.map((candidate) => candidate.text)];
+    const embeddings = await getEmbeddings(texts);
+    
+    if (embeddings) {
+      scoredCandidates = scoreCandidatesWithEmbeddings(queryText, candidates, embeddings);
+    } else {
+      scoredCandidates = scoreCandidatesFallback(queryText, candidates);
     }
-
-    const selected = selectClusterRepresentativeSentences(scoredCandidates, minSentences, maxSentences, intent);
-    logNarrativeStatus(narrativeMeta, requestId);
-    return attachOverviewMeta(buildOverview(selected), narrativeMeta);
   }
 
-  const scoredCandidates = scoreCandidatesFallback(queryText, candidates);
-
+  // --- 📝 GENERATION & ALIGNMENT ---
+  // Now we take those perfectly sorted candidates and write the summary
   const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT, queryText);
   const narrativeSummary = await generateNarrativeSummary({
     queryText,
@@ -1182,6 +1235,7 @@ export async function generateOverview(query, rows, options = {}) {
     evidenceSentences,
     statusRef: narrativeMeta,
   });
+
   if (narrativeSummary) {
     const alignedResults = await alignNarrativeSummaryToEvidence(
       narrativeSummary,
@@ -1198,6 +1252,7 @@ export async function generateOverview(query, rows, options = {}) {
     }
   }
 
+  // If narrative generation didn't work out, we fall back to the best extractive sentences
   const selected = selectBestSentences(scoredCandidates, minSentences, maxSentences, intent);
   logNarrativeStatus(narrativeMeta, requestId);
   return attachOverviewMeta(buildOverview(selected), narrativeMeta);

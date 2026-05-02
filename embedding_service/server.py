@@ -237,21 +237,22 @@ def embed(req: EmbeddingRequest):
 @app.post("/summarize")
 def summarize(req: SummarizeRequest):
     combined_context = "\n".join([str(t) for t in (req.texts or []) if str(t).strip()])
+    
+    # Keep the highlights for the short snippet preview
     highlights = extractive_highlights(req.texts or [], req.query, top_k=2)
 
-    use_extractive_summary = bool(req.style and req.style.lower() in ("google", "snippet", "natural", "conversational"))
+    # 🌟 THE FIX: Force the system to ALWAYS use the Generative AI! 🌟
+    # We removed the 'if use_extractive_summary' bypass. 
+    # Now it actually writes a custom summary using the perfectly reranked evidence.
+    summary = generate_summary(
+        combined_context,
+        query=req.query,
+        intent=req.intent,
+        style=req.style,
+        max_new_tokens=req.max_new_tokens or 800,
+    )
 
-    if use_extractive_summary:
-        summary = build_extractive_summary(req.query, highlights, max_sentences=4)
-    else:
-        summary = generate_summary(
-            combined_context,
-            query=req.query,
-            intent=req.intent,
-            style=req.style,
-            max_new_tokens=req.max_new_tokens or 800,
-        )
-
+    # Build a short search-style snippet (for the fallback preview)
     top_sentence = None
     top_score = -1.0
     for src_h in highlights:

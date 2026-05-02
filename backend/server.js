@@ -208,6 +208,33 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Temporary /version probe handler (diagnostic): log caller headers and return 204.
+// Remove after identifying the polling source.
+app.get('/version', (req, res) => {
+  try {
+    const probeInfo = {
+      time: new Date().toISOString(),
+      ip: req.ip,
+      method: req.method,
+      path: req.path,
+      headers: {
+        origin: req.headers.origin || null,
+        referer: req.headers.referer || null,
+        'user-agent': req.headers['user-agent'] || null,
+        via: req.headers.via || null,
+      },
+      query: req.query || null,
+    };
+
+    console.info('[version-probe] incoming /version probe', probeInfo);
+  } catch (e) {
+    console.warn('[version-probe] failed to log probe', e?.message || e);
+  }
+
+  // Respond with no content to minimize client-side handling.
+  res.status(204).send();
+});
+
 // ─── NDLI Proxy ──────────────────────────────────────────────────────────────
 // POST /api/search  →  forwards to NDLI's aiOverview.php
 app.post('/api/search', async (req, res) => {

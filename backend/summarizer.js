@@ -11,8 +11,14 @@ const MAX_SOURCES = 6;
 const DEDUPE_SIMILARITY_THRESHOLD = 0.78;
 const CLUSTER_SIMILARITY_THRESHOLD = 0.75;
 
-const EMBEDDING_SERVICE_URL = (process.env.EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
+// Embedding service URLs - supports local-first fallback
+const LOCAL_EMBEDDING_SERVICE_URL = (process.env.LOCAL_EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
+const HOSTED_EMBEDDING_SERVICE_URL = (process.env.HOSTED_EMBEDDING_SERVICE_URL || process.env.EMBEDDING_SERVICE_URL || 'https://anupkr913563-ndli-embedding-service.hf.space').replace(/\/+$/, '');
+// Default to local, but can be overridden via EMBEDDING_SERVICE_URL or HOSTED_EMBEDDING_SERVICE_URL
+let EMBEDDING_SERVICE_URL = LOCAL_EMBEDDING_SERVICE_URL;
+
 const EMBEDDING_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.EMBEDDING_SERVICE_TIMEOUT_MS, 4500);
+const LOCAL_SERVICE_HEALTH_TIMEOUT_MS = parsePositiveInt(process.env.LOCAL_SERVICE_HEALTH_TIMEOUT_MS, 2000);
 const SUMMARIZE_SERVICE_TIMEOUT_MS = parsePositiveInt(process.env.AI_OVERVIEW_SUMMARIZE_TIMEOUT_MS, 45000);
 const RAG_EVIDENCE_SENTENCE_LIMIT = parsePositiveInt(process.env.AI_OVERVIEW_RAG_EVIDENCE_SENTENCE_LIMIT, 24);
 const RAG_MAX_NEW_TOKENS = parsePositiveInt(process.env.AI_OVERVIEW_RAG_MAX_NEW_TOKENS, 800);
@@ -352,14 +358,72 @@ function buildCandidates(rows) {
   return candidates;
 }
 
+// Track which service is currently being used
+let localServiceAvailable = null;
+let lastLocalHealthCheck = 0;
+const HEALTH_CHECK_CACHE_MS = 30000; // Cache health checks for 30 seconds
+
+async function checkLocalServiceHealth() {
+  const now = Date.now();
+  // Use cached result if fresh
+  if (localServiceAvailable !== null && (now - lastLocalHealthCheck) < HEALTH_CHECK_CACHE_MS) {
+    return localServiceAvailable;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), LOCAL_SERVICE_HEALTH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${LOCAL_EMBEDDING_SERVICE_URL}/health`, {
+      signal: controller.signal,
+    });
+    localServiceAvailable = response.ok;
+    lastLocalHealthCheck = now;
+    
+    if (response.ok) {
+      console.log('[summarizer] ✓ Local embedding service is available');
+      EMBEDDING_SERVICE_URL = LOCAL_EMBEDDING_SERVICE_URL;
+    } else {
+      console.log('[summarizer] ✗ Local embedding service health check failed, falling back to hosted');
+      EMBEDDING_SERVICE_URL = HOSTED_EMBEDDING_SERVICE_URL;
+    }
+  } catch (error) {
+    console.log('[summarizer] ✗ Local embedding service unavailable, using hosted', {
+      error: error?.message,
+    });
+    localServiceAvailable = false;
+    lastLocalHealthCheck = now;
+    EMBEDDING_SERVICE_URL = HOSTED_EMBEDDING_SERVICE_URL;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  return localServiceAvailable;
+}
+
+async function getActiveEmbeddingServiceUrl() {
+  // Check local service health on each request
+  await checkLocalServiceHealth();
+  return EMBEDDING_SERVICE_URL;
+}
+
+// Initialize embedding service health on startup
+export async function initializeEmbeddingService() {
+  console.log('[summarizer] Checking embedding service availability...');
+  await checkLocalServiceHealth();
+  console.log(`[summarizer] Using embedding service: ${EMBEDDING_SERVICE_URL}`);
+}
+
 async function getEmbeddings(texts) {
   if (!Array.isArray(texts) || texts.length === 0) return null;
+
+  const activeUrl = await getActiveEmbeddingServiceUrl();
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), EMBEDDING_SERVICE_TIMEOUT_MS);
 
   try {
-    const response = await fetch(`${EMBEDDING_SERVICE_URL}/embed`, {
+    const response = await fetch(`${activeUrl}/embed`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -393,7 +457,7 @@ async function getEmbeddings(texts) {
   } catch (error) {
     console.warn('[summarizer] embedding lookup failed, falling back to heuristic scoring', {
       message: error?.message,
-      serviceUrl: EMBEDDING_SERVICE_URL,
+      attemptedUrl: activeUrl,
     });
     return null;
   } finally {
@@ -739,11 +803,13 @@ async function generateNarrativeSummary({ queryText, intent, evidenceSentences, 
     .filter((item) => item && typeof item.text === 'string' && item.text.trim())
     .map((item) => item.text.trim());
 
+  const activeUrl = await getActiveEmbeddingServiceUrl();
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), SUMMARIZE_SERVICE_TIMEOUT_MS);
 
   try {
-    const response = await fetch(`${EMBEDDING_SERVICE_URL}/summarize`, {
+    const response = await fetch(`${activeUrl}/summarize`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -789,7 +855,7 @@ async function generateNarrativeSummary({ queryText, intent, evidenceSentences, 
     }
     console.warn('[summarizer] narrative summarization failed, falling back to extractive overview', {
       message: error?.message,
-      serviceUrl: EMBEDDING_SERVICE_URL,
+      attemptedUrl: activeUrl,
     });
     return null;
   } finally {

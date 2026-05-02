@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { fileURLToPath } from 'url';
-import { generateOverview } from './summarizer.js';
+import { generateOverview, initializeEmbeddingService } from './summarizer.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
@@ -310,7 +310,7 @@ app.use((err, _req, res, next) => {
 });
 
 function startServer() {
-  app.listen(PORT, () => {
+  app.listen(PORT, async () => {
     console.log(`\n🚀 NDLI Backend running on http://localhost:${PORT}`);
     console.log(`   Health check: http://localhost:${PORT}/health`);
     console.log(`   Search proxy: POST http://localhost:${PORT}/api/search\n`);
@@ -319,6 +319,9 @@ function startServer() {
     console.log(`   NDLI retries: ${NDLI_RETRY_COUNT}`);
     console.log(`   NDLI retry delay: ${NDLI_RETRY_DELAY_MS}ms`);
     console.log(`   CORS origins: ${CORS_ORIGINS.join(', ')}\n`);
+    
+    // Initialize embedding service and check availability
+    await initializeEmbeddingService();
   });
 }
 

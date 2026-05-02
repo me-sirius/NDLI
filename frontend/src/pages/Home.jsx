@@ -128,14 +128,45 @@ function summarizerBadgeConfig(status) {
     }
 }
 
-    function normalizeAiSummaryText(value) {
-        return String(value || '')
+function domainFallbackMessage(domainKey, errorCode, trimmedQuery) {
+    const domainLabel = DOMAINS.find((domain) => domain.key === domainKey)?.label || 'the selected domain';
+    const queryText = trimmedQuery ? ` for “${trimmedQuery}”` : '';
+
+    if (errorCode === 'NDLI_UPSTREAM_TIMEOUT' || errorCode === 'NDLI_UPSTREAM_UNREACHABLE' || errorCode === 'BACKEND_SEARCH_ROUTE_ISSUE') {
+        return {
+            title: `${domainLabel} is temporarily unstable`,
+            body: `NDLI could not return data${queryText} in ${domainLabel}. Try School Education or Career Development, or refresh the search after a moment.`,
+        };
+    }
+
+    if (errorCode === 'CORS_BLOCKED' || errorCode === 'BACKEND_UNREACHABLE' || errorCode === 'BACKEND_TIMEOUT') {
+        return {
+            title: 'Backend connection issue',
+            body: `The backend could not complete the search${queryText}. Try again in a moment or switch to a different domain.`,
+        };
+    }
+
+    if (trimmedQuery) {
+        return {
+            title: `No results in ${domainLabel}`,
+            body: `This domain returned no results${queryText}. If the topic is academic, try School Education or Career Development first.`,
+        };
+    }
+
+    return {
+        title: `No results in ${domainLabel}`,
+        body: `Try a broader keyword or switch to School Education or Career Development.`,
+    };
+}
+
+function normalizeAiSummaryText(value) {
+    return String(value || '')
         .toLowerCase()
         .replace(/\[\d+\]/g, '')
         .replace(/[^a-z0-9\s]/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
-    }
+}
 
 // ─── Skeleton loading components ─────────────────────────────────────────────
 const AISkeleton = () => (
@@ -388,6 +419,9 @@ export default function Home() {
     const apiErrorHint = apiRequestState?.status === 'error'
         ? backendIssueHint(apiRequestState?.errorCode)
         : '';
+    const fallbackMessage = !loading && searchPerformed && !hasResults
+        ? domainFallbackMessage(selectedDomain, apiRequestState?.errorCode, trimmedQuery)
+        : null;
 
     const retrySearch = () => {
         if (!canRetry) return;
@@ -753,7 +787,7 @@ export default function Home() {
                                 {hasFilteredResults ? (
                                     <div className="space-y-2.5 pb-12 stagger-children" role="list" aria-label="Search results list">
                                         {filteredResults.map((r, index) => {
-                                            const normalizedType = normalizeResultType(r.type);
+                                            const normalizedType = normalizeResultType(r?.type);
                                             const typeText = resultTypeLabel(normalizedType);
 
                                             return (
@@ -821,10 +855,28 @@ export default function Home() {
                                 <div className="w-16 h-16 mx-auto rounded-2xl bg-slate-100 flex items-center justify-center mb-4">
                                     <SearchIcon className="w-7 h-7 text-slate-400" />
                                 </div>
-                                <h3 className="text-lg font-bold text-slate-700 mb-1.5">No results found</h3>
+                                <h3 className="text-lg font-bold text-slate-700 mb-1.5">
+                                    {fallbackMessage?.title || 'No results found'}
+                                </h3>
                                 <p className="text-sm text-slate-500">
-                                    Try broader keywords or switch to another domain.
+                                    {fallbackMessage?.body || 'Try broader keywords or switch to another domain.'}
                                 </p>
+                                <div className="mt-5 flex flex-wrap justify-center gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => setSelectedDomain('se')}
+                                        className="rounded-full border border-blue-200 bg-blue-50 px-4 py-2 text-xs font-semibold text-[#0b57d0] hover:bg-blue-100 transition-colors"
+                                    >
+                                        Try School Education
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setSelectedDomain('cd')}
+                                        className="rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
+                                    >
+                                        Try Career Development
+                                    </button>
+                                </div>
                             </div>
                         )}
                     </section>

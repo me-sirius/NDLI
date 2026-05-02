@@ -70,3 +70,4 @@ backend/history/
 
 # Internal docs (not for production)
 docs/INTERNAL_NDLI_PIPELINE_EXPLAINED.md
+Helper.md

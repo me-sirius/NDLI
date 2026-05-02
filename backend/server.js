@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { fileURLToPath } from 'url';
-import { generateOverview, initializeEmbeddingService } from './summarizer.js';
+import { generateOverview } from './summarizer.js';
 import { execSync } from 'child_process';
 
 const app = express();
@@ -320,40 +320,6 @@ function startServer() {
     console.log(`   NDLI retries: ${NDLI_RETRY_COUNT}`);
     console.log(`   NDLI retry delay: ${NDLI_RETRY_DELAY_MS}ms`);
     console.log(`   CORS origins: ${CORS_ORIGINS.join(', ')}\n`);
-    
-    // Initialize embedding service and check availability
-    await initializeEmbeddingService();
-    // Expose a simple /version endpoint for deploy verification
-    app.get('/version', async (req, res) => {
-      const backendCommit = process.env.BACKEND_VERSION || (() => {
-        try {
-          return String(execSync('git rev-parse --short HEAD')).trim();
-        } catch (e) {
-          return 'unknown';
-        }
-      })();
-
-      const buildTime = process.env.BACKEND_BUILD_TIME || '';
-
-      // Try to get embedding service version from its /version endpoint
-      const embeddingServiceUrl = (process.env.LOCAL_EMBEDDING_SERVICE_URL || process.env.HOSTED_EMBEDDING_SERVICE_URL || process.env.EMBEDDING_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
-      let embeddingInfo = { serviceUrl: embeddingServiceUrl, commitSha: null, ok: false };
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 1500);
-        const r = await fetch(`${embeddingServiceUrl}/version`, { signal: controller.signal });
-        clearTimeout(timer);
-        if (r.ok) {
-          const d = await r.json();
-          embeddingInfo.commitSha = d?.commitSha || null;
-          embeddingInfo.ok = true;
-        }
-      } catch (e) {
-        // ignore
-      }
-
-      res.json({ backend: { commitSha: backendCommit, buildTime }, embedding: embeddingInfo });
-    });
   });
 }
 

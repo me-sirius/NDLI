@@ -758,7 +758,7 @@ function pickEvidenceSentences(scoredCandidates, intent, maxEvidence, queryText)
   return evidence;
 }
 
-async function generateNarrativeSummary({ queryText, intent, evidenceSentences, statusRef }) {
+async function generateNarrativeSummary({ queryText, intent, domain, evidenceSentences, statusRef }) {
   if (!ENABLE_GENERATIVE_OVERVIEW) {
     if (statusRef) {
       statusRef.status = 'skipped';
@@ -800,7 +800,7 @@ async function generateNarrativeSummary({ queryText, intent, evidenceSentences, 
         texts: evidenceTexts,
         query: queryText,
         intent,
-        style: 'google',
+        style: domain,
         max_new_tokens: RAG_MAX_NEW_TOKENS,
       }),
       signal: controller.signal,
@@ -1108,6 +1108,10 @@ export async function generateOverview(query, rows, options = {}) {
   const maxSentences = Math.max(requestedMin, requestedMax);
   const intent = detectIntent(queryText);
   const requestId = options.requestId;
+  
+  // 🌟 Layer 2: Extract domain for Audience Adaptation
+  const domain = options.domain || 'se'; 
+
   const narrativeMeta = {
     status: 'skipped',
     reason: 'not_attempted',
@@ -1124,21 +1128,16 @@ export async function generateOverview(query, rows, options = {}) {
 
   let scoredCandidates = [];
 
-  // --- 🌟 NEW: THE RERANKER PIPELINE 🌟 ---
-  // We politely ask our Python service to score all candidates
+  // --- 🌟 RERANKER PIPELINE 🌟 ---
   const rerankedResults = await rerankCandidates(queryText, candidates);
 
   if (rerankedResults && rerankedResults.length > 0) {
-    // 1. Create a quick lookup map for the scores
     const scoreMap = new Map();
     rerankedResults.forEach((r) => scoreMap.set(r.text, r.score));
 
-    // 2. Attach the scores to our candidates
     scoredCandidates = candidates.map((candidate) => {
-      // The python reranker returns a raw "logit" score (can be negative or positive).
       const rawScore = scoreMap.get(candidate.text) || -10; 
-      
-      // We convert that math into a friendly 0 to 1 percentage using a Sigmoid function
+      // Sigmoid normalization to 0-1 range
       const normalizedScore = 1 / (1 + Math.exp(-rawScore));
 
       return {
@@ -1147,19 +1146,10 @@ export async function generateOverview(query, rows, options = {}) {
         credibilityScore: sourceCredibilityScore(candidate.source),
         sentenceTokens: tokenize(candidate.text)
       };
-    }).sort((a, b) => {
-      // Sort highest score first, fallback to credibility/position on ties
-      if (b.score !== a.score) return b.score - a.score;
-      const credibilityA = Number.isFinite(a?.credibilityScore) ? a.credibilityScore : 0;
-      const credibilityB = Number.isFinite(b?.credibilityScore) ? b.credibilityScore : 0;
-      if (credibilityB !== credibilityA) return credibilityB - credibilityA;
-      if (a.rowIndex !== b.rowIndex) return a.rowIndex - b.rowIndex;
-      return a.sentenceIndex - b.sentenceIndex;
-    });
+    }).sort(sortByScoreThenPosition);
 
   } else {
-    // --- 🚨 OLD PIPELINE (FALLBACK) 🚨 ---
-    // If the reranker is down or times out, we smoothly fall back to the original method!
+    // --- 🚨 FALLBACK PIPELINE 🚨 ---
     const texts = [queryText, ...candidates.map((candidate) => candidate.text)];
     const embeddings = await getEmbeddings(texts);
     
@@ -1170,12 +1160,27 @@ export async function generateOverview(query, rows, options = {}) {
     }
   }
 
+  // --- 🌟 LAYER 10: THE RELEVANCE GATEKEEPER 🌟 ---
+  // If the top rerank score is too low, we know the results are irrelevant.
+  if (scoredCandidates.length > 0 && scoredCandidates[0].score < 0.15) {
+    console.warn(`[summarizer] 🚨 RELEVANCE GATEKEEPER: Top score ${scoredCandidates[0].score} is too low. Rejecting results.`);
+    return attachOverviewMeta({
+      snippet: "We could not find highly relevant academic documents for this query. Please try rephrasing your search.",
+      snippetWithCitations: "We could not find highly relevant academic documents for this query.",
+      sentences: ["No relevant documents found."],
+      sources: []
+    }, narrativeMeta);
+  }
+
   // --- 📝 GENERATION & ALIGNMENT ---
-  // Now we take those perfectly sorted candidates and write the summary
+  // Pick evidence sentences from the scored candidates
   const evidenceSentences = pickEvidenceSentences(scoredCandidates, intent, RAG_EVIDENCE_SENTENCE_LIMIT, queryText);
+
+  // Call the Python summarizer EXACTLY ONCE with the domain persona.
   const narrativeSummary = await generateNarrativeSummary({
     queryText,
     intent,
+    domain, // 🌟 This triggers the 'se', 'he', or 'rs' persona in Python
     evidenceSentences,
     statusRef: narrativeMeta,
   });
@@ -1196,7 +1201,7 @@ export async function generateOverview(query, rows, options = {}) {
     }
   }
 
-  // If narrative generation didn't work out, we fall back to the best extractive sentences
+  // Final Fallback: If generation fails, use the best extractive sentences
   const selected = selectBestSentences(scoredCandidates, minSentences, maxSentences, intent);
   logNarrativeStatus(narrativeMeta, requestId);
   return attachOverviewMeta(buildOverview(selected), narrativeMeta);

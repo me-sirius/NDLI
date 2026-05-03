@@ -49,21 +49,34 @@ def build_prompt(context: str, query: str | None, intent: str | None, style: str
     safe_query = (query or "").strip()
     safe_intent = (intent or "general").strip()
 
-    if style and style.lower() in ("google", "natural", "conversational"):
+    # 🌟 Layer 2: Audience Persona Mapping
+    # 'style' will now receive the domain ID ('se', 'he', 'rs') from your Node backend
+    domain_persona = {
+        "se": "Explain like a friendly school teacher. Use simple analogies, avoid complex jargon, and keep sentences engaging for students.",
+        "he": "Explain like a university professor. Use formal academic language and provide a balanced, thorough overview of the subject.",
+        "rs": "Explain like a peer reviewer for a scientific journal. Be highly technical, focus on data and methodology, and use precise terminology.",
+        "default": "Provide a clear, factual, and balanced academic summary."
+    }
+    
+    # Determine the persona based on the domain (passed in 'style')
+    persona = domain_persona.get(style.lower() if style else "default", domain_persona["default"])
+
+    # If the user wants the "Google-style" conversational summary (Natural Language)
+    if style and style.lower() in ("se", "google", "natural", "conversational"):
         header = (
+            f"{persona}\n\n"
             "Write a comprehensive, natural-language summary that directly answers the query. "
-            "Focus on the actual content, concepts, and information from the sources - NOT on metadata like 'this is a video lecture' or 'this is a chapter'. "
-            "Extract and synthesize the substantive information about the topic itself. "
-            "Write 4-6 descriptive sentences that explain what the topic is, how it works, its key components, and why it matters. "
-            "Use a conversational but informative tone similar to Google Search's AI summaries. "
-            "Do NOT use structured headings. Do NOT mention sources, citations, or document metadata. "
-            "If the sources don't contain substantive information about the topic, say so clearly."
+            "Focus on the actual content and concepts - NOT on metadata like 'this is a video' or 'this is a chapter'. "
+            "Extract and synthesize the substantive information. Write 4-6 descriptive sentences. "
+            "Do NOT use structured headings. Do NOT mention document metadata. "
+            "When referencing facts, include parenthetical citations like [1] to match the source order."
         )
         if safe_query:
             header += f"\n\nQuery: {safe_query}"
         header += "\n\nInformation from sources:\n"
         return header + context
 
+    # Otherwise, use the "Structured Academic" format
     intent_guidance = ""
     if safe_intent == "definition":
         intent_guidance = "Start with a one-sentence definition, then explain key aspects and significance. "
@@ -72,14 +85,13 @@ def build_prompt(context: str, query: str | None, intent: str | None, style: str
     elif safe_intent == "timeline":
         intent_guidance = "Present events in chronological order and include dates only if present in the sources. "
     elif safe_intent == "comparison":
-        intent_guidance = "Compare the items clearly by stating 2–4 concrete differences or contrasts supported by the sources. "
+        intent_guidance = "Compare the items clearly by stating 2–4 concrete differences supported by the sources. "
     elif safe_intent == "biography":
-        intent_guidance = "Explain who the person is, key roles/contributions, and relevant time period supported by the sources. "
+        intent_guidance = "Explain who the person is, key roles/contributions, and relevant time period. "
 
     header = (
-        "Explain the topic in structured academic format.\n\n"
-        "Start with an 'Overview:' paragraph (2-4 sentences) summarizing the main idea.\n\n"
-        "Return output using exactly this structure (include the headings):\n\n"
+        f"{persona}\n\n"
+        "Explain the topic in structured academic format using exactly this structure (include the headings):\n\n"
         "Overview:\n"
         "Definition:\n"
         "Process:\n"
@@ -87,9 +99,8 @@ def build_prompt(context: str, query: str | None, intent: str | None, style: str
         "Importance:\n\n"
         "Write descriptive educational paragraphs under each section based ONLY on the provided sources.\n"
         + intent_guidance
-        + "Do not add facts not present in the sources. When referencing facts, include short parenthetical citations like [1] that match the source order provided.\n"
-        + "Do not echo the 'Query' or 'Intent' labels.\n"
-        + "If an aspect is not supported by the sources, write 'Not covered in sources.'"
+        + "Do not add facts not present in the sources. Include parenthetical citations like [1].\n"
+        + "If an aspect is not supported, write 'Not covered in sources.'"
     )
 
     if safe_query:
@@ -98,14 +109,7 @@ def build_prompt(context: str, query: str | None, intent: str | None, style: str
     header += f"\nIntent: {safe_intent}"
     header += "\n\nSources (evidence):\n"
 
-    if style and style.lower() in ("snippet"):
-        header += (
-            "\nProduce a short search-style snippet (1-3 sentences) suitable for a search results preview.\n"
-            "Then provide a longer descriptive summary following the structured headings above.\n"
-        )
-
     return header + context
-
 
 def _is_too_short(summary: str) -> bool:
     words = [w for w in str(summary or "").split() if w]
@@ -229,10 +233,40 @@ def embed(req: EmbeddingRequest):
 
 @app.post("/summarize")
 def summarize(req: SummarizeRequest):
-    combined_context = "\n".join([str(t) for t in (req.texts or []) if str(t).strip()])
-    highlights = extractive_highlights(req.texts or [], req.query, top_k=2)
+    if not req.texts or not str(req.query).strip():
+        return {
+            "summary": "Please provide a valid query and sources.", 
+            "snippet": "", 
+            "highlights": []
+        }
 
-    # We enforce generation here to use our shiny new LLM!
+    # 🌟 THE GATEKEEPER: We use the Reranker to grade the PHP script's documents
+    pairs = [[req.query, text] for text in req.texts]
+    scores = reranker.predict(pairs)
+    
+    valid_texts = []
+    for text, score in zip(req.texts, scores):
+        # BGE Reranker outputs raw logits. 
+        # Usually > 0 means highly relevant, < 0 means increasingly irrelevant.
+        # -2.0 is a great threshold to aggressively block complete garbage (like airplanes for a banking query).
+        if score > -2.0: 
+            valid_texts.append(text)
+            
+    # If the PHP script sent us ONLY garbage, we abort before Gemma even starts!
+    if not valid_texts:
+        return {
+            "summary": "We could not find highly relevant academic documents for this query. Please try rephrasing your search.",
+            "snippet": "",
+            "highlights": []
+        }
+
+    # If we have valid documents, we proceed as normal (but only using the good ones!)
+    combined_context = "\n".join([str(t) for t in valid_texts if str(t).strip()])
+    
+    # We also only highlight from the valid texts
+    highlights = extractive_highlights(valid_texts, req.query, top_k=2)
+
+    # Now Gemma 4 only reads the filtered, highly-relevant context
     summary = generate_summary(
         combined_context,
         query=req.query,
@@ -241,6 +275,7 @@ def summarize(req: SummarizeRequest):
         max_new_tokens=req.max_new_tokens or 800,
     )
 
+    # Build a short search-style snippet (for the fallback preview)
     top_sentence = None
     top_score = -1.0
     for src_h in highlights:

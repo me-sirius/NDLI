@@ -279,6 +279,7 @@ app.post('/api/search', async (req, res) => {
       minSentences: 4,
       maxSentences: 8,
       requestId,
+      domain,
     });
 
     res.json({

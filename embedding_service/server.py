@@ -45,6 +45,20 @@ class RerankRequest(BaseModel):
     top_k: int = 5
 
 
+def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
+    """Breaks long text into overlapping semantic chunks for better retrieval."""
+    if not text or len(text) < chunk_size:
+        return [text] if text else []
+    
+    words = text.split()
+    chunks = []
+    # We move through the text, creating overlapping windows
+    for i in range(0, len(text), chunk_size - overlap):
+        chunk = text[i:i + chunk_size]
+        if len(chunk) > 50: # Ignore tiny fragments
+            chunks.append(chunk.strip())
+    return chunks
+
 def build_prompt(context: str, query: str | None, intent: str | None, style: str | None = None) -> str:
     safe_query = (query or "").strip()
     safe_intent = (intent or "general").strip()
@@ -240,53 +254,47 @@ def summarize(req: SummarizeRequest):
             "highlights": []
         }
 
-    # 🌟 THE GATEKEEPER: We use the Reranker to grade the PHP script's documents
-    pairs = [[req.query, text] for text in req.texts]
+    # 1. Semantic Chunking (Enrichment)
+    all_chunks = []
+    for doc in req.texts:
+        all_chunks.extend(chunk_text(doc))
+    
+    if not all_chunks:
+        return {"summary": "No processable content found.", "snippet": "", "highlights": []}
+
+    # 2. Rerank the Chunks (Finding the absolute best evidence)
+    pairs = [[req.query, chunk] for chunk in all_chunks]
     scores = reranker.predict(pairs)
     
-    valid_texts = []
-    for text, score in zip(req.texts, scores):
-        # BGE Reranker outputs raw logits. 
-        # Usually > 0 means highly relevant, < 0 means increasingly irrelevant.
-        # -2.0 is a great threshold to aggressively block complete garbage (like airplanes for a banking query).
-        if score > -2.0: 
-            valid_texts.append(text)
-            
-    # If the PHP script sent us ONLY garbage, we abort before Gemma even starts!
-    if not valid_texts:
+    # 3. Layer 10 Quality Gate & Selection
+    scored_chunks = sorted(zip(all_chunks, scores), key=lambda x: x[1], reverse=True)
+    # Only keep chunks with high relevance
+    valid_chunks = [c for c, s in scored_chunks if s > -2.0]
+
+    if not valid_chunks:
         return {
             "summary": "We could not find highly relevant academic documents for this query. Please try rephrasing your search.",
             "snippet": "",
             "highlights": []
         }
 
-    # If we have valid documents, we proceed as normal (but only using the good ones!)
-    combined_context = "\n".join([str(t) for t in valid_texts if str(t).strip()])
+    # 4. Grounded Context Building (Selecting Top 10 Chunks)
+    best_context = "\n\n".join(valid_chunks[:10])
     
-    # We also only highlight from the valid texts
-    highlights = extractive_highlights(valid_texts, req.query, top_k=2)
-
-    # Now Gemma 4 only reads the filtered, highly-relevant context
+    # 5. Persona-Aware Generation (Layer 2)
+    # We call generate_summary which uses your updated build_prompt logic
     summary = generate_summary(
-        combined_context,
+        best_context,
         query=req.query,
         intent=req.intent,
-        style=req.style,
+        style=req.style, # This carries 'se', 'he', or 'rs' for the persona
         max_new_tokens=req.max_new_tokens or 800,
     )
 
-    # Build a short search-style snippet (for the fallback preview)
-    top_sentence = None
-    top_score = -1.0
-    for src_h in highlights:
-        for h in src_h:
-            if h.get("score", 0) > top_score:
-                top_score = h.get("score", 0)
-                top_sentence = h.get("text")
+    # Use the absolute top chunk for the fallback snippet
+    snippet = valid_chunks[0][:400]
 
-    snippet = (top_sentence or "")[:400]
-
-    return {"summary": summary, "snippet": snippet, "highlights": highlights}
+    return {"summary": summary, "snippet": snippet, "highlights": []}
 
 
 @app.post("/rerank")

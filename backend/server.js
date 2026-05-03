@@ -275,6 +275,12 @@ app.post('/api/search', async (req, res) => {
     const raw = await ndliRes.json();
     const rows = Array.isArray(raw?.rows) ? raw.rows : [];
     const normalizedRows = rows.map(normalizeRow).filter((r) => r.title || r.desc);
+    
+    console.info(`[${requestId}] /api/search: NDLI result counts`, {
+      ndliRawRows: rows.length,
+      normalizedRows: normalizedRows.length,
+    });
+
     const aiSummary = await generateOverview(query, normalizedRows, {
       minSentences: 4,
       maxSentences: 8,

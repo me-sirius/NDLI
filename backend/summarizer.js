@@ -1109,6 +1109,13 @@ export async function generateOverview(query, rows, options = {}) {
   const intent = detectIntent(queryText);
   const requestId = options.requestId;
   
+  // Log input rows vs. candidate limit
+  console.info(`[${requestId || 'overview'}] generateOverview: processing rows`, {
+    inputRows: safeRows.length,
+    candidateRowLimit: CANDIDATE_ROW_LIMIT,
+    rowsToProcess: Math.min(safeRows.length, CANDIDATE_ROW_LIMIT),
+  });
+  
   // 🌟 Layer 2: Extract domain for Audience Adaptation
   const domain = options.domain || 'se'; 
 
@@ -1124,6 +1131,9 @@ export async function generateOverview(query, rows, options = {}) {
   }
 
   const candidates = buildCandidates(safeRows);
+  console.info(`[${requestId || 'overview'}] generateOverview: candidates built`, {
+    candidates: candidates.length,
+  });
   if (!candidates.length) return null;
 
   let scoredCandidates = [];

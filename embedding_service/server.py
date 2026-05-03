@@ -1,9 +1,8 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer, CrossEncoder
+from huggingface_hub import InferenceClient
 import os
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import uvicorn
 import re
 import numpy as np
@@ -14,14 +13,14 @@ app = FastAPI()
 print("Loading Embedding model...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# 2. Load Summarization Model
-print("Loading Summarization model...")
-SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "google/flan-t5-base")
-summary_tokenizer = AutoTokenizer.from_pretrained(SUMMARY_MODEL_NAME)
-summary_model = AutoModelForSeq2SeqLM.from_pretrained(SUMMARY_MODEL_NAME)
-summary_model.eval()
-summary_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-summary_model.to(summary_device)
+# 2. Setup the Gemma 4 API Client (The "Industrial Kitchen")
+print("Setting up Gemma 4 API Client...")
+HF_TOKEN = os.getenv("HF_TOKEN")
+# If the token is missing, the code will still run, but generation will fail safely
+llm_client = InferenceClient(
+    "google/gemma-4-26B-A4B-it", 
+    token=HF_TOKEN,
+)
 
 # 3. Load Reranker Model (The "Senior Professor")
 print("Loading Reranker model (BAAI/bge-reranker-large)...")
@@ -117,26 +116,24 @@ def _is_too_short(summary: str) -> bool:
     return sentence_marks < 3
 
 
-def _generate_once(prompt: str, max_new_tokens: int, length_penalty: float) -> str:
-    inputs = summary_tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1024,
-    )
-    inputs = {k: v.to(summary_device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        outputs = summary_model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            num_beams=4,
-            length_penalty=length_penalty,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
+def _generate_once(prompt: str, max_new_tokens: int) -> str:
+    # Gemma loves conversational formats, so we set it up like a chat!
+    messages = [
+        {"role": "system", "content": "You are a highly intelligent academic tutor for the National Digital Library of India. Answer queries using strictly the provided source text."},
+        {"role": "user", "content": prompt}
+    ]
+    
+    try:
+        # We make the API call to Hugging Face Serverless
+        response = llm_client.chat_completion(
+            messages=messages,
+            max_tokens=max_new_tokens,
+            temperature=0.3, # Keeps the AI factual and prevents hallucination
         )
-
-    return summary_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[LLM Error]: {e}")
+        return "Not enough information could be processed to generate a summary at this time."
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -213,15 +210,11 @@ def build_extractive_summary(query: str | None, highlights: list[list[dict]], ma
 
 def generate_summary(context: str, query: str | None = None, intent: str | None = None, style: str | None = None, max_new_tokens: int = 800) -> str:
     prompt = build_prompt(context=context, query=query, intent=intent, style=style)
-    summary = _generate_once(prompt, max_new_tokens=max_new_tokens, length_penalty=1.15)
+    summary = _generate_once(prompt, max_new_tokens=max_new_tokens)
 
     if _is_too_short(summary):
         longer_prompt = prompt + "\n\nEnsure a longer Overview is produced covering all sections. Expand on each heading with supporting details from the sources."
-        summary_retry = _generate_once(
-            longer_prompt,
-            max_new_tokens=max(max_new_tokens, 800),
-            length_penalty=1.25,
-        )
+        summary_retry = _generate_once(longer_prompt, max_new_tokens=max(max_new_tokens, 800))
         if len(summary_retry) > len(summary):
             summary = summary_retry
 
@@ -237,13 +230,9 @@ def embed(req: EmbeddingRequest):
 @app.post("/summarize")
 def summarize(req: SummarizeRequest):
     combined_context = "\n".join([str(t) for t in (req.texts or []) if str(t).strip()])
-    
-    # Keep the highlights for the short snippet preview
     highlights = extractive_highlights(req.texts or [], req.query, top_k=2)
 
-    # 🌟 THE FIX: Force the system to ALWAYS use the Generative AI! 🌟
-    # We removed the 'if use_extractive_summary' bypass. 
-    # Now it actually writes a custom summary using the perfectly reranked evidence.
+    # We enforce generation here to use our shiny new LLM!
     summary = generate_summary(
         combined_context,
         query=req.query,
@@ -252,7 +241,6 @@ def summarize(req: SummarizeRequest):
         max_new_tokens=req.max_new_tokens or 800,
     )
 
-    # Build a short search-style snippet (for the fallback preview)
     top_sentence = None
     top_score = -1.0
     for src_h in highlights:
